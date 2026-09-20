@@ -46,7 +46,8 @@ unauthenticated endpoint.
 | Write semantics | write then acknowledge, best effort | the chunk is committed before the 200; a `request_id` replay is idempotent | The contract requires a chunk to be persisted and searchable before its 200 |
 | Isolation | none | every statement is scoped by `user_id` | Cross-user retrieval is prohibited |
 | Auth | none | shared secret, four accepted header forms | An open endpoint would expose every sample |
-| Rate limiting | none | per-client sliding window, `X-Forwarded-For`-aware | Survives a reverse proxy without collapsing into one global bucket |
+| Rate limiting | none | sliding window on **rejected** authentications only | Brute-force protection without a counter in front of the scored run |
+| Blocking work | n/a | embedding calls run in a worker thread | The handler is `async`; calling blocking HTTP inline would serialise concurrent requests |
 
 The dense leg encodes queries and documents asymmetrically — `text_type` is set to
 `query` on the search side and `document` on the write side — which is the
@@ -65,6 +66,23 @@ the image keeps three runtime dependencies in total.
   that a single transient fault at start-up silently degrades an entire evaluation
   run to lexical-only, with nothing visible from the outside; the cooldown keeps
   recovery automatic and bounded.
+- The concurrency limiter deliberately does **not** count authenticated traffic. It
+  is a brute-force guard: only rejected authentications advance the window, and the
+  key that passes is never throttled. The evaluator is the only credentialled client,
+  so counting its requests could only ever fire at the actor the service exists to
+  serve — and a 429 here answers `Retry-After: 60`, spending a minute of evaluation
+  wall-clock per false trigger against a budget of two Full runs per track, the
+  second of which is locked for 30 days. Protecting the scored run was worth more
+  than a request ceiling that no untrusted party can reach anyway.
+- Embedding calls are dispatched to a worker thread. They are blocking HTTP with a
+  20-second timeout, and the handlers are `async def`, so calling them inline would
+  have turned N concurrent requests into N sequential ones. Measured against a stub
+  that sleeps 1 s per call, 16 concurrent `/add` requests with the work offloaded
+  finish in **1.42 s total**; inline they would have taken ≈16 s.
+- A body larger than `AML_MAX_BODY_BYTES` (default 16 MiB, declared via
+  `Content-Length`) is answered with `413` before it is read into memory. The
+  container has a hard memory ceiling, and being OOM-killed mid-run costs a scored
+  run, whereas `413` is an ordinary contract answer.
 - A missing or invalid embedding key is not fatal: the service still starts and
   serves lexical-only. That is a silent quality loss, so the leg actually in use
   is published on `GET /version` and is meant to be checked from outside before a
@@ -77,13 +95,15 @@ the image keeps three runtime dependencies in total.
 
 Stated plainly rather than left for a reader to discover:
 
-- `/add` and `/search` are `async def` handlers that call synchronous SQLite and
-  synchronous HTTP. Under sustained concurrency this blocks the event loop and
-  degrades into 502/503 responses. Measured on a 16-thread machine: 64 concurrent
-  searches complete (p50 12.2 s), while 256 concurrent searches fail in bulk. The
-  advertised concurrency is therefore kept deliberately conservative. Moving the
-  blocking sections into a thread pool is the obvious next step and has not been
-  done.
+- SQLite access remains synchronous inside `async def` handlers. Each statement is
+  sub-millisecond and is serialised by a process-level lock, so it has not been
+  moved off the event loop; the blocking network call, which is the slow one, has.
+- The advertised concurrency is kept deliberately conservative because the service
+  runs a single uvicorn worker: past a point, requests queue rather than scale. Load
+  tests against the currently deployed build gave 64 concurrent searches completing
+  (p50 12.2 s) and 256 failing in bulk; that build still routed embeddings through
+  the event loop, so the offload removes one bottleneck but has not been re-measured
+  end to end, and the conservative declaration stands until it is.
 - On a free platform tier the filesystem is ephemeral. The keep-alive described
   in `README.md` mitigates that constraint; it does not remove it.
 

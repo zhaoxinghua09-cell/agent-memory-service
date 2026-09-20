@@ -47,7 +47,8 @@ api-key: <key>
 | `AML_EMBED_COOLDOWN` | `90` | how long a failed dense leg is parked before being retried |
 | `AML_EMBED_MODEL` | `bge-m3` | Ollama fallback embedding model |
 | `AML_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama fallback endpoint; unreachable ⇒ dense legs skipped |
-| `AML_RATE_LIMIT` | `240` | requests per minute per client IP |
+| `AML_RATE_LIMIT` | `240` | per-minute ceiling applied to **rejected** authentications only; a valid key is never throttled |
+| `AML_MAX_BODY_BYTES` | `16777216` | request bodies larger than this are answered `413` unread |
 | `AML_KEEPALIVE_URL` | *(unset)* | optional self-ping; keeps a free-tier instance resident |
 | `AML_KEEPALIVE_SECONDS` | `600` | self-ping interval, floored at 60 |
 

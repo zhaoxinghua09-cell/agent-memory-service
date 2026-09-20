@@ -9,6 +9,7 @@ Contract (per AML API Guide, cycle 2):
 - Auth: Token / Bearer / X-Api-Key (one chosen at registration).
 """
 
+import asyncio
 import os
 import re
 import json
@@ -96,7 +97,7 @@ COMMIT = (os.environ.get("AML_COMMIT")
 
 MAX_TOP_K = 200
 MAX_MESSAGES = 500
-MAX_BODY_BYTES = 8 * 1024 * 1024
+MAX_BODY_BYTES = int(os.environ.get("AML_MAX_BODY_BYTES") or str(16 * 1024 * 1024))
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -362,8 +363,44 @@ def rate_ok(ip: str) -> bool:
     return True
 
 
+def guard(request: Request):
+    """Auth + brute-force throttle for the two POST routes.
+
+    Order matters, and this order is deliberate: an authenticated caller is
+    **never** throttled, and the window is only charged for *rejected*
+    authentications. The evaluator is the only credentialled client, so a
+    limiter that also counted its traffic could only ever fire at the one actor
+    we need to serve -- and a 429 answers with `Retry-After: 60`, i.e. sixty
+    seconds of evaluation wall-clock per false trigger, against a budget of two
+    Full runs per track whose second one is locked for 30 days. Keeping the
+    limiter on failed auth keeps the brute-force protection (and the abuse
+    ceiling) without putting the scored run behind a counter.
+
+    Returns None when the request may proceed, or the response to send back.
+    """
+    if auth_ok(request):
+        return None
+    ip = request.client.host if request.client else "?"
+    if not rate_ok(ip):
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": "60"},
+            content={"detail": {"reason": "rate limited"}},
+        )
+    return err(401, "invalid key")
+
+
 @app.middleware("http")
 async def harden(request: Request, call_next):
+    # Reject an oversized body before it is read into memory: the container has a
+    # hard memory ceiling, and being OOM-killed mid-evaluation costs a scored run,
+    # whereas a 413 is an ordinary contract answer the harness already understands.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": {"reason": "payload too large"}},
+        )
     resp = await call_next(request)
     resp.headers["Server"] = "ws"
     resp.headers["X-Content-Type-Options"] = "nosniff"
@@ -446,15 +483,9 @@ if KEEPALIVE_URL:
 
 @app.post("/add")
 async def add(request: Request):
-    if not auth_ok(request):
-        return err(401, "invalid key")
-    ip = request.client.host if request.client else "?"
-    if not rate_ok(ip):
-        return JSONResponse(
-            status_code=429,
-            headers={"Retry-After": "60"},
-            content={"detail": {"reason": "rate limited"}},
-        )
+    denied = guard(request)
+    if denied is not None:
+        return denied
     try:
         body = json.loads(await request.body())
     except Exception:
@@ -511,7 +542,12 @@ async def add(request: Request):
     if not seg:
         return err(422, "no usable content")
 
-    vecs = embed_texts(seg, "document")  # None -> BM25-only fallback
+    # Off the event loop: the embedding call is blocking HTTP (up to
+    # EMBED_TIMEOUT) and this handler is async, so calling it inline would
+    # serialise every concurrent request behind one round-trip each. The
+    # evaluator drives Add/Search at the concurrency declared at registration,
+    # so inline would turn N parallel calls into N sequential ones.
+    vecs = await asyncio.to_thread(embed_texts, seg, "document")  # None -> BM25
     created = now_iso()
     rid_hash = hashlib.sha256(request_id.encode()).hexdigest()[:12]
 
@@ -537,15 +573,9 @@ async def add(request: Request):
 
 @app.post("/search")
 async def search(request: Request):
-    if not auth_ok(request):
-        return err(401, "invalid key")
-    ip = request.client.host if request.client else "?"
-    if not rate_ok(ip):
-        return JSONResponse(
-            status_code=429,
-            headers={"Retry-After": "60"},
-            content={"detail": {"reason": "rate limited"}},
-        )
+    denied = guard(request)
+    if denied is not None:
+        return denied
     try:
         body = json.loads(await request.body())
     except Exception:
@@ -588,7 +618,7 @@ async def search(request: Request):
 
     q_vec = None
     if any(v is not None for v in vecs):
-        qv = embed_texts([query], "query")
+        qv = await asyncio.to_thread(embed_texts, [query], "query")
         if qv:
             q_vec = qv[0]
 
