@@ -38,8 +38,33 @@ services:
         value: /data/memory.db
       # 云端没有 Ollama：直接指向不可达的回环端口，让连接立刻失败，
       # 服务随即走纯 BM25 检索路径，不必每次等待连接超时。
+      # 这只是**兜底腿**：配了 AML_DASHSCOPE_KEY 时，稠密检索由下面那条走。
       - key: AML_OLLAMA_URL
         value: http://127.0.0.1:9
+      # ── 稠密检索后端：托管的 text-embedding-v4 ──────────────────────────
+      # 开放方法榜把 Embedding 模型钉死为 text-embedding-v4，所以这一腿优先于 Ollama。
+      #
+      # ⚠️ 这一项**必须人工填写**（第三方密钥平台无法生成），因此只能用 sync: false。
+      #    与 AML_MEMORY_KEY 不同，这里**故意不做 fail-fast**：漏填时服务照常启动、
+      #    静默降级为纯 BM25，而不是拒绝启动 —— 部署失败比降级更难排查。
+      #    代价是「配错也看不出来」，所以报名前**必须**用外部只读端点核验：
+      #        curl https://<service>.onrender.com/version
+      #    确认 dense_leg.backend == "dashscope" 且 model == "text-embedding-v4"。
+      #    若显示 bm25-only，说明 key 没生效，此时**不满足开放方法榜的模型约束**。
+      - key: AML_DASHSCOPE_KEY
+        sync: false
+      # 地域必须与 Key 配对：**各地域的 API Key 互不通用**（用错地域返回
+      # InvalidApiKey），且 text-embedding-v4 的免费额度**只在华北2（北京）发放**。
+      # 因此默认北京；若换成新加坡地域的 Key，把这里改成
+      # https://dashscope-intl.aliyuncs.com
+      - key: AML_DASHSCOPE_BASE
+        value: https://dashscope.aliyuncs.com
+      - key: AML_DASHSCOPE_MODEL
+        value: text-embedding-v4
+      # 1024 维：官方推荐的性能/成本平衡点，且与开源权重 bge-m3 同维，
+      # 使稠密/词法融合公式无需按维度特判。
+      - key: AML_EMBED_DIM
+        value: "1024"
       # 单实例；按调用方限流（Dockerfile 已让 uvicorn 采信 X-Forwarded-For，
       # 否则这个桶是全网共用的）。
       # 取值依据：官方口径「429 → 平台按 Retry-After 最多等 60 秒后重试」，

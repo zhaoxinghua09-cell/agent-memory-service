@@ -7,19 +7,23 @@ permalink: workbuddy/2026-09-20-19-28-08/aml-handoff/readme-1
 # Agent Memory Service — self-hosted Add / Search API
 
 A minimal, dependency-light memory service exposing the two endpoints an
-evaluation harness calls. It runs fully offline: retrieval uses local embeddings
-when an Ollama server is reachable and falls back to BM25 otherwise, so it still
-answers inside a no-network judging sandbox.
+evaluation harness calls. Retrieval is hybrid: BM25 over tokenised chunks fused
+with a dense cosine term. The dense leg is the hosted `text-embedding-v4` model;
+if it is unreachable the service falls back to a local Ollama server and then to
+BM25 alone, so it keeps answering instead of failing.
 
 ## Endpoints
 
 | Method | Path      | Purpose |
 |--------|-----------|---------|
 | `GET`  | `/health` | liveness probe — returns `{"status":"ok"}`; does not touch the database |
+| `GET`  | `/version`| read-only build identity: revision, git commit, and the dense leg actually in use |
 | `POST` | `/add`    | ingest a session (`messages[]`, optional `user_id`, `session_id`, metadata) |
 | `POST` | `/search` | retrieve memories for a query (`query`, optional `user_id`, `top_k`) |
 
-Both `POST` routes require the shared secret. Accepted forms:
+`/health` and `/version` are unauthenticated and read nothing but process state;
+they carry no key, path or sample data. The two `POST` routes require the shared
+secret. Accepted forms:
 
 ```
 X-API-Key: <key>
@@ -35,8 +39,14 @@ api-key: <key>
 | `AML_API_KEY` | *(unset)* | shared secret; takes precedence when non-empty |
 | `AML_MEMORY_KEY` | *(unset)* | fallback secret, typically a platform-generated value |
 | `AML_DB_PATH` | `service/data/memory.db` | SQLite file |
-| `AML_EMBED_MODEL` | `bge-m3` | Ollama embedding model |
-| `AML_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama endpoint; unreachable ⇒ BM25 only |
+| `AML_DASHSCOPE_KEY` | *(unset)* | Model Studio API key; unset ⇒ dense leg skipped |
+| `AML_DASHSCOPE_BASE` | `https://dashscope.aliyuncs.com` | Model Studio region endpoint; a key is valid in **one** region only |
+| `AML_DASHSCOPE_MODEL` | `text-embedding-v4` | dense embedding model |
+| `AML_EMBED_DIM` | `1024` | embedding width; must match `AML_DASHSCOPE_MODEL` |
+| `AML_EMBED_TIMEOUT` | `20` | per-embedding-call timeout, seconds |
+| `AML_EMBED_COOLDOWN` | `90` | how long a failed dense leg is parked before being retried |
+| `AML_EMBED_MODEL` | `bge-m3` | Ollama fallback embedding model |
+| `AML_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama fallback endpoint; unreachable ⇒ dense legs skipped |
 | `AML_RATE_LIMIT` | `240` | requests per minute per client IP |
 | `AML_KEEPALIVE_URL` | *(unset)* | optional self-ping; keeps a free-tier instance resident |
 | `AML_KEEPALIVE_SECONDS` | `600` | self-ping interval, floored at 60 |
@@ -105,8 +115,10 @@ itself, so a probe there always looks healthy and wakes nothing.
 ## Design notes
 
 - **Storage** — a single SQLite file in WAL mode; no external database.
-- **Retrieval** — hybrid: BM25 over tokenized chunks always, fused with local
-  embedding similarity when the Ollama endpoint answers. No outbound calls.
+- **Retrieval** — hybrid: BM25 over tokenized chunks always, fused with a dense
+  cosine term (`0.65·dense + 0.35·lexical`) whenever an embedding leg answers.
+  Queries and documents are encoded asymmetrically (`text_type=query` on search,
+  `document` on write).
 - **Writes are synchronous and idempotent** — a chunk is committed before the 200
   is returned, and a replay of the same `request_id` is accepted without
   duplicating data.

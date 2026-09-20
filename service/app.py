@@ -59,8 +59,41 @@ if not API_KEY:
     API_KEY = _secrets.token_urlsafe(24)
     print(f"[dev] AML_API_KEY not set -> generated ephemeral key (loopback only): {API_KEY}")
 
+# --- dense retrieval legs ---------------------------------------------------
+# Ollama leg: a local inference server. Kept for self-hosted runs; on a PaaS
+# free tier nothing listens on loopback, so this leg is inert there unless
+# AML_OLLAMA_URL is pointed at an external host.
 EMBED_MODEL = os.environ.get("AML_EMBED_MODEL", "bge-m3")
 OLLAMA_URL = os.environ.get("AML_OLLAMA_URL", "http://127.0.0.1:11434")
+
+# DashScope leg: the hosted text-embedding-v4 model. The open-method division
+# pins the embedding model to this exact name, so when a key is present this
+# leg takes priority over Ollama.
+#
+# The default is the Beijing region, not Singapore, because a Model Studio API
+# key is issued per region and is not interchangeable: the free v4 quota is
+# also granted per region. A key minted in one region returns
+# `InvalidApiKey` against the other, so the default has to match the region the
+# operator actually provisioned.
+DASHSCOPE_KEY = (os.environ.get("AML_DASHSCOPE_KEY") or "").strip()
+DASHSCOPE_BASE = (
+    os.environ.get("AML_DASHSCOPE_BASE") or "https://dashscope.aliyuncs.com"
+).rstrip("/")
+DASHSCOPE_MODEL = os.environ.get("AML_DASHSCOPE_MODEL", "text-embedding-v4")
+EMBED_DIM = int(os.environ.get("AML_EMBED_DIM") or "1024")
+EMBED_BATCH = 10  # text-embedding-v4 accepts at most 10 texts per call
+EMBED_TIMEOUT = float(os.environ.get("AML_EMBED_TIMEOUT") or "20")
+# A transient network fault must not disable the dense leg for the whole run,
+# so a failure parks it for this many seconds instead of latching it off.
+EMBED_COOLDOWN = float(os.environ.get("AML_EMBED_COOLDOWN") or "90")
+
+# Render injects RENDER_GIT_COMMIT on every build, so the live revision stays
+# externally verifiable without anyone maintaining a version string by hand.
+VERSION = os.environ.get("AML_VERSION") or "0.3.0"
+COMMIT = (os.environ.get("AML_COMMIT")
+          or os.environ.get("RENDER_GIT_COMMIT")
+          or "unknown")
+
 MAX_TOP_K = 200
 MAX_MESSAGES = 500
 MAX_BODY_BYTES = 8 * 1024 * 1024
@@ -127,14 +160,83 @@ def now_iso() -> str:
 
 # ---------------------------------------------------------------- embeddings
 
-_embed_ok: Optional[bool] = None
+_embed_state = {"ok": None, "backend": None, "fail_until": 0.0}
 
 
-def embed_texts(texts):
-    """Return list of vectors (normalized) or None if Ollama unavailable."""
-    global _embed_ok
-    if _embed_ok is False:
-        return None
+def _l2(v):
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / n for x in v]
+
+
+def _dashscope_headers():
+    return {
+        "Authorization": f"Bearer {DASHSCOPE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def _via_dashscope_native(batch, text_type):
+    """`text-embedding-v4` through the native DashScope endpoint.
+
+    The native route is preferred over the OpenAI-compatible one because only
+    it exposes `text_type`, and the query side here is a short question matched
+    against much longer stored chunks -- exactly the asymmetry that parameter
+    exists to correct. Returns None on any non-2xx or unparseable body, so the
+    caller can fall through to the compatible route.
+    """
+    url = f"{DASHSCOPE_BASE}/api/v1/services/embeddings/text-embedding/text-embedding"
+    body = {
+        "model": DASHSCOPE_MODEL,
+        "input": {"texts": batch},
+        "parameters": {"dimension": EMBED_DIM, "text_type": text_type},
+    }
+    try:
+        r = httpx.post(url, headers=_dashscope_headers(), json=body,
+                       timeout=EMBED_TIMEOUT)
+        if r.status_code >= 400:
+            return None
+        embs = ((r.json() or {}).get("output") or {}).get("embeddings") or []
+        embs = sorted(embs, key=lambda e: e.get("text_index", 0))
+        vecs = [e.get("embedding") for e in embs]
+        if vecs and all(vecs):
+            return [_l2(v) for v in vecs]
+    except Exception:
+        pass
+    return None
+
+
+def _via_dashscope_compatible(batch):
+    """Same model through the OpenAI-compatible route (no `text_type`)."""
+    url = f"{DASHSCOPE_BASE}/compatible-mode/v1/embeddings"
+    body = {"model": DASHSCOPE_MODEL, "input": batch, "dimensions": EMBED_DIM}
+    try:
+        r = httpx.post(url, headers=_dashscope_headers(), json=body,
+                       timeout=EMBED_TIMEOUT)
+        r.raise_for_status()
+        data = (r.json() or {}).get("data") or []
+        data = sorted(data, key=lambda d: d.get("index", 0))
+        vecs = [d.get("embedding") for d in data]
+        if vecs and all(vecs):
+            return [_l2(v) for v in vecs]
+    except Exception:
+        pass
+    return None
+
+
+def _via_dashscope(texts, text_type):
+    out = []
+    for i in range(0, len(texts), EMBED_BATCH):
+        batch = texts[i:i + EMBED_BATCH]
+        vecs = _via_dashscope_native(batch, text_type)
+        if vecs is None:
+            vecs = _via_dashscope_compatible(batch)
+        if vecs is None or len(vecs) != len(batch):
+            return None
+        out.extend(vecs)
+    return out
+
+
+def _via_ollama(texts):
     try:
         r = httpx.post(
             f"{OLLAMA_URL}/api/embed",
@@ -144,16 +246,40 @@ def embed_texts(texts):
         r.raise_for_status()
         embs = r.json().get("embeddings")
         if not embs or len(embs) != len(texts):
-            raise ValueError("bad embeddings")
-        out = []
-        for v in embs:
-            n = math.sqrt(sum(x * x for x in v)) or 1.0
-            out.append([x / n for x in v])
-        _embed_ok = True
-        return out
+            return None
+        return [_l2(v) for v in embs]
     except Exception:
-        _embed_ok = False
         return None
+
+
+def embed_texts(texts, text_type="document"):
+    """Dense leg. Returns L2-normalised vectors, or None to fall back to BM25.
+
+    Order: hosted `text-embedding-v4` when a key is configured, then local
+    Ollama. A failure parks the leg for EMBED_COOLDOWN seconds instead of
+    latching it off for the process lifetime -- an earlier permanent latch meant
+    one transient blip at startup silently downgraded every later request of
+    the run, and that is invisible from the outside.
+    """
+    if not texts:
+        return None
+    if _embed_state["fail_until"] > time.time():
+        return None
+    vecs, backend = None, None
+    if DASHSCOPE_KEY:
+        vecs = _via_dashscope(texts, text_type)
+        if vecs is not None:
+            backend = "dashscope"
+    if vecs is None:
+        vecs = _via_ollama(texts)
+        if vecs is not None:
+            backend = "ollama"
+    if vecs is None:
+        _embed_state.update(ok=False, backend=None,
+                            fail_until=time.time() + EMBED_COOLDOWN)
+        return None
+    _embed_state.update(ok=True, backend=backend, fail_until=0.0)
+    return vecs
 
 
 # ---------------------------------------------------------------- chunking
@@ -253,6 +379,36 @@ def err(status: int, reason: str):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/version")
+async def version():
+    """Read-only build/configuration identity.
+
+    Exists so a reviewer can confirm from outside which revision is live and
+    which embedding leg actually backs `/search` -- a system whose retrieval
+    path cannot be identified from the outside cannot be version-reviewed.
+    Deliberately carries no secret and no request data: it names the model and
+    the leg in use, never a key, a filesystem path or a sample.
+    """
+    if DASHSCOPE_KEY:
+        leg, model = "dashscope", DASHSCOPE_MODEL
+    elif _embed_state["backend"] == "ollama":
+        leg, model = "ollama", EMBED_MODEL
+    else:
+        leg, model = "bm25-only", None
+    return {
+        "version": VERSION,
+        "commit": COMMIT,
+        "contract": ["POST /add", "POST /search", "GET /health", "GET /version"],
+        "retrieval": "bm25 + dense fusion (0.65*dense + 0.35*lexical)",
+        "dense_leg": {
+            "backend": leg,
+            "model": model,
+            "dim": EMBED_DIM if model else None,
+            "healthy": _embed_state["ok"],
+        },
+    }
 
 
 # ------------------------------------------------- keep-alive（可选，默认关闭）
@@ -355,7 +511,7 @@ async def add(request: Request):
     if not seg:
         return err(422, "no usable content")
 
-    vecs = embed_texts(seg)  # None -> BM25-only fallback
+    vecs = embed_texts(seg, "document")  # None -> BM25-only fallback
     created = now_iso()
     rid_hash = hashlib.sha256(request_id.encode()).hexdigest()[:12]
 
@@ -432,7 +588,7 @@ async def search(request: Request):
 
     q_vec = None
     if any(v is not None for v in vecs):
-        qv = embed_texts([query])
+        qv = embed_texts([query], "query")
         if qv:
             q_vec = qv[0]
 
