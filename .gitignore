@@ -1,0 +1,36 @@
+# ---- 绝不入库：凭证与运行时数据 ----
+*凭证*.txt
+凭证*.txt
+*_凭证.txt
+_DEPLOY*
+secrets*
+secret*.txt
+*.key
+*.pem
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+service/data/*.db
+
+# ---- 内部工作资料，不公开 ----
+_internal/
+*.internal.md
+*内部*.md
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ---- 系统/编辑器 ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

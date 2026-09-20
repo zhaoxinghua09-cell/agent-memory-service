@@ -1,0 +1,61 @@
+# 保活：每 10 分钟轻敲一次 /health，防止 Render 免费实例休眠。
+#
+# 为什么需要（不是优化，是正确性问题）：
+# - Render 免费实例 15 分钟无入站流量即休眠；休眠会停容器，而免费档文件系统是
+#   临时的 ⇒ 容器内的 SQLite（也就是选手提交的记忆）**随之丢失**。
+#   AML 的 Add 契约要求「每个 chunk 必须在返回 200 之前已持久化且可检索」，
+#   一旦跨过一次休眠，先前的写入就凭空消失。
+# - 为什么用外部定时器而不是应用自己打点：应用自己打点只能在「实例已经醒着」时生效；
+#   实例一旦睡着，自打点随容器一起停摆，永远醒不过来。外部定时器才能把睡着的实例唤醒。
+#
+# ⚠️ 三条必须知道的代价/坑（改本文件前先读）：
+# 1. **别指向 /robots.txt**：免费实例休眠期间，该路径由 Render 自己拦截返回
+#    disallow-all，请求根本到不了应用 —— 探针永远是 200，服务照样睡。
+#    这里指向应用真实提供的 /health（该路由不查数据库，开销最小）。
+# 2. **实例小时额度**：Render 每工作区每月仅 750 实例小时，常驻一个服务约吃 720 小时。
+#    若工作区里还有别的免费服务，会被一起挤停。这是「保活」的真实价格。
+# 3. **Actions 分钟数（算错过的坑，务必按这个口径核）**：GitHub **按 job 向上取整到整分钟**计费 ——
+#    跑 15 秒的 job 也记 **1 分钟**。本工作流 144 次/天 ⇒ 若跑在**私有仓库**上约 **4,320 分钟/月**，
+#    而 Free 档私有仓库只有 **2,000 分钟/月**，且额度耗尽后是**静默停跑**（不报错、不留痕）——
+#    表象会变成「保活失效 → 实例休眠 → SQLite 清空」，典型的静默数据丢失。
+#    本仓库是**公开仓库**（开源组要求），公开仓库的 Actions 用量免费且不限量，无此约束。
+#    ⚠️ 若将来把本仓库改回 private，必须同时降低本工作流频率或改用其它外部探针。
+#    另外 GitHub 对长期无活动的仓库会自动停用定时工作流，偶尔提交一次即可保持启用。
+# 4. **schedule 抖动**：GitHub 的 cron 只保证「不早于」，新工作流首跑常延迟 5–20 分钟，
+#    也可能整点跳过。若需要「连续性」而非「次数」，可改为「长驻 job + job 内每 5 分钟打点
+#    + concurrency 串行」——排队机制能给出比 cron 更稳的节奏（单 job 上限 6 小时）。
+#
+# 同时：GitHub 的 schedule 只保证「不早于」，高峰期可能延迟若干分钟 ——
+# 这也是刻钟间隔取 10 分钟（而不是贴着 15 分钟）的原因，留出延迟余量。
+
+name: keep-alive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: keep-alive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping the health endpoint
+        env:
+          HEALTH_URL: https://agent-memory-service.onrender.com/health
+        run: |
+          set -u
+          # --max-time 100：冷启动最长约 1 分钟，给足余量
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 100 --retry 2 --retry-delay 5 "$HEALTH_URL" || true)
+          echo "GET $HEALTH_URL -> $code"
+          # 200 = 醒着且健康；预热失败不让整个工作流红掉（下一次再试即可）
+          if [ "$code" != "200" ]; then
+            echo "::warning::health returned $code"
+            exit 1
+          fi

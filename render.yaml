@@ -1,0 +1,50 @@
+# Render Blueprint —— 一键部署 AML Add/Search API
+#
+# 用法：Render 控制台 → New + → Blueprint → 选本仓库 → Apply
+# Render 会读出本文件并自动建好服务 —— **全程无需手工填写任何值**，
+# 鉴权密钥由平台在 provision 时生成（见下方 generateValue）。
+#
+# 为什么用 Render：免费 Hobby 档即可，无需信用卡，支持 Dockerfile，
+# 由 Render 自己的网络拉取本仓库（与本机网络状况无关）。
+
+services:
+  - type: web
+    name: agent-memory-service
+    runtime: docker
+    plan: free
+    # 亚太节点，离 AML 评测平台更近；Render 支持 singapore / oregon / ohio /
+    # virginia / frankfurt 等，若 singapore 不可选改成 oregon
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: false
+    envVars:
+      # 鉴权密钥（＝报给 AML 的 Memory System Key）。
+      #
+      # 历史教训：原先写 sync: false（部署时人工填写），但 Render 在 Blueprint
+      # 「首次创建」流程里若漏填，**不报错**，而是静默建出一条空变量 → 服务在托管
+      # 模式 fail-fast 拒绝启动 → 表现为「部署失败」，极易被误判成构建问题/账号问题。
+      #
+      # 现改为 generateValue: true —— 由 Render 在 provision 时生成 base64 编码的
+      # 256 位随机值，**全程无需人工输入**，Blueprint 同步一次即可拿到可用密钥。
+      # 查看/复制：Dashboard → 该服务 → Environment → AML_MEMORY_KEY → 眼睛图标。
+      - key: AML_MEMORY_KEY
+        generateValue: true
+      # 注意：此处**不再声明** AML_API_KEY。应用会优先采用非空的 AML_API_KEY，
+      # 你随时可以在 Dashboard 里自行给 AML_API_KEY 赋值来覆盖平台生成的密钥；
+      # 不声明它也能避免 Blueprint 同步时出现 Required 校验失败。
+      # 运行时数据库落点（容器内路径）
+      - key: AML_DB_PATH
+        value: /data/memory.db
+      # 云端没有 Ollama：直接指向不可达的回环端口，让连接立刻失败，
+      # 服务随即走纯 BM25 检索路径，不必每次等待连接超时。
+      - key: AML_OLLAMA_URL
+        value: http://127.0.0.1:9
+      # 单实例；按调用方限流（Dockerfile 已让 uvicorn 采信 X-Forwarded-For，
+      # 否则这个桶是全网共用的）。
+      # 取值依据：官方口径「429 → 平台按 Retry-After 最多等 60 秒后重试」，
+      # 而本服务对 429 回的正是 Retry-After: 60 ⇒ 每误触一次就赔 60 秒评测墙钟。
+      # 平台在评测表单里自报的并发上限可达 add 64 / search 256，故此处放宽到
+      # 3000/min（50 QPS）——足以吃掉文档口径的并发突发，同时仍能挡住滥用。
+      - key: AML_RATE_LIMIT
+        value: "3000"
