@@ -30,12 +30,29 @@
 
 name: keep-alive
 
+# ⚠️ 实测记录（2026-09-20，勿重复踩）：本工作流于 14:35:56Z 加入默认分支，
+# 此后 **2.3 小时 · `*/10` cron · `event=schedule` 触发数 = 0**（仅 1 次手动
+# `workflow_dispatch` 成功）。仓库为 public、非 fork、`state=active`、
+# 默认分支连续有 push —— 配置侧无异常，判定为 GitHub 调度侧未投递，而非延迟。
+#
+# 据此做了两处调整，目的是「消掉两个可疑点 + 让失败可观测」：
+#   1. 增加 push 触发：每次推送至少留下一次真实运行记录，便于判断调度是否恢复；
+#      同时把工作流重新注册一遍（新加入的 schedule 有时需要重新注册才会被调度）。
+#   2. 权限由 `permissions: {}` 改为显式 `contents: read`：留一个极端情况下
+#      「零权限工作流不被调度」的可能性，收窄排查面。
+#
+# ❗结论仍然成立且必须写在这里：**保活不能只押 GitHub 的 cron。**
+#   生产上应再挂一个外部探针（如免费监控服务的 5 分钟 HTTP 检查）打
+#   `/health`；两者互为兜底。若本 cron 始终不投递，外部探针即为唯一真实保活手段。
+
 on:
   schedule:
     - cron: "*/10 * * * *"
+  push:
   workflow_dispatch:
 
-permissions: {}
+permissions:
+  contents: read
 
 concurrency:
   group: keep-alive
