@@ -13,7 +13,8 @@ COPY service/ ./
 
 EXPOSE 8000
 
-# 单进程即可：SQLite + 本地嵌入，评测期流量很低。
+# 单进程即可：SQLite + 每请求一次托管嵌入调用，评测期流量很低。
+# （嵌入走 text-embedding-v4，服务内部有 90 秒冷却与 BM25 降级；不装 torch/onnx。）
 # 尊重平台注入的 PORT（Render / 多数 PaaS 会注入），未注入时回落 8000。
 # 注意：PORT 存在即代表托管环境，app.py 会要求必须显式配置 AML_API_KEY 才启动。
 #

@@ -32,9 +32,12 @@ The straightforward way to build a service of this shape is:
 - call a hosted embedding API for semantic search;
 - leave authentication and rate limiting to the deployment layer.
 
-That baseline has three problems in an offline judging sandbox: it has no lexical
-ranking, it requires network egress for every query, and it exposes an
-unauthenticated endpoint.
+That baseline has three problems. It has no lexical ranking, so a rare literal
+token carries no weight; it makes the success of every query depend on a single
+outbound call, so one bad minute at a provider degrades or fails a whole run; and
+it exposes an unauthenticated endpoint. The dense leg is still used here — the
+open-method division pins the model — but it is fused with lexical scoring and is
+treated as a leg that can fail rather than as the only way to answer.
 
 ## 3. What this implementation changes
 

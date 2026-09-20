@@ -90,7 +90,7 @@ EMBED_COOLDOWN = float(os.environ.get("AML_EMBED_COOLDOWN") or "90")
 
 # Render injects RENDER_GIT_COMMIT on every build, so the live revision stays
 # externally verifiable without anyone maintaining a version string by hand.
-VERSION = os.environ.get("AML_VERSION") or "0.3.0"
+VERSION = os.environ.get("AML_VERSION") or "0.4.0"
 COMMIT = (os.environ.get("AML_COMMIT")
           or os.environ.get("RENDER_GIT_COMMIT")
           or "unknown")
