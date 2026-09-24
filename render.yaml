@@ -11,7 +11,15 @@ services:
   - type: web
     name: agent-memory-service
     runtime: docker
-    plan: free
+    plan: starter
+    # 2026-09-25：实例已升 Starter、持久盘已在控制台挂载。
+    # 把两者写进声明的原因：防止 Blueprint 同步把实例类型回滚成 free、
+    # 把 /data 磁盘移除 —— 任何一处回滚都会让「Add 返回 200 前已持久化」
+    # 与「30 天公网稳定」重新变成虚假声明。
+    disks:
+      - name: aml-data
+        diskSizeGB: 1
+        mountPath: /data
     # 亚太节点，离 AML 评测平台更近；Render 支持 singapore / oregon / ohio /
     # virginia / frankfurt 等，若 singapore 不可选改成 oregon
     region: singapore
