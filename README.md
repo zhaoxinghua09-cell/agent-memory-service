@@ -7,10 +7,12 @@ permalink: workbuddy/2026-09-20-19-28-08/aml-handoff/readme-1
 # Agent Memory Service — self-hosted Add / Search API
 
 A minimal, dependency-light memory service exposing the two endpoints an
-evaluation harness calls. Retrieval is hybrid: BM25 over tokenised chunks fused
-with a dense cosine term. The dense leg is the hosted `text-embedding-v4` model;
-if it is unreachable the service falls back to a local Ollama server and then to
-BM25 alone, so it keeps answering instead of failing.
+evaluation harness calls. Retrieval is hybrid: BM25 over per-message chunks
+fused with a dense cosine term by weighted reciprocal-rank fusion, followed by
+same-session adjacency expansion and temporal-aware reranking. The dense leg is
+the hosted `text-embedding-v4` model; if it is unreachable the service falls
+back to a local Ollama server and then to BM25 alone, so it keeps answering
+instead of failing.
 
 ## Endpoints
 
@@ -49,6 +51,13 @@ api-key: <key>
 | `AML_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama fallback endpoint; unreachable ⇒ dense legs skipped |
 | `AML_RATE_LIMIT` | `240` | per-minute ceiling applied to **rejected** authentications only; a valid key is never throttled |
 | `AML_MAX_BODY_BYTES` | `16777216` | request bodies larger than this are answered `413` unread |
+| `AML_RRF_K` / `AML_W_RRF_DENSE` / `AML_W_RRF_LEX` | `60` / `1.0` / `0.5` | weighted-RRF fusion constant and dense/lexical weights |
+| `AML_ADJ_SEEDS` / `AML_ADJ_WINDOW` / `AML_ADJ_FACTOR` | `20` / `1` / `0.9` | adjacency expansion: seed count, ±neighbour window, neighbour score factor |
+| `AML_W_NOW` / `AML_W_REC` / `AML_W_DATE` | `0.6` / `0.12` / `0.35` | temporal reranking: current-state boost, mild recency nudge, query-year match |
+| `AML_RECENCY_HALF_LIFE_DAYS` / `AML_W_STALE` / `AML_STALE_YEARS` | `30` / `0.4` / `1` | current-state reranking: ingest-recency half-life (days), soft penalty for chunks anchored to an old year, that year threshold |
+| `AML_W_CHANGE` | `0.5` | additive boost for chunks whose content announces a state change ("just moved", "last month") on current-state queries |
+| `AML_COS_REL_GATE` | `0.5` | temporal factors apply only inside the semantic relevance band: raw cosine >= gate * best cosine; with no dense leg temporal reordering is off |
+| `AML_CHUNK_WORDS` / `AML_CHUNK_OVERLAP` | `300` / `50` | sliding-window split for long messages |
 | `AML_KEEPALIVE_URL` | *(unset)* | optional self-ping; keeps a free-tier instance resident |
 | `AML_KEEPALIVE_SECONDS` | `600` | self-ping interval, floored at 60 |
 
@@ -116,10 +125,13 @@ itself, so a probe there always looks healthy and wakes nothing.
 ## Design notes
 
 - **Storage** — a single SQLite file in WAL mode; no external database.
-- **Retrieval** — hybrid: BM25 over tokenized chunks always, fused with a dense
-  cosine term (`0.65·dense + 0.35·lexical`) whenever an embedding leg answers.
-  Queries and documents are encoded asymmetrically (`text_type=query` on search,
-  `document` on write).
+- **Retrieval** — hybrid: BM25 over per-message chunks (long messages split into
+  ~300-word sliding windows) fused with a dense cosine term by **weighted RRF**
+  (`1.0/(K+rank_dense) + 0.5/(K+rank_lex)`); the top seeds are then expanded with
+  same-session neighbours (±1), and a temporal-aware factor boosts recent chunks
+  when the query asks about the present ("now / 最近 / 目前") or matches a year
+  named in the query. Queries and documents are encoded asymmetrically
+  (`text_type=query` on search, `document` on write).
 - **Writes are synchronous and idempotent** — a chunk is committed before the 200
   is returned, and a replay of the same `request_id` is accepted without
   duplicating data.

@@ -7,6 +7,30 @@ Contract (per AML API Guide, cycle 2):
               -> 200 {data:[{id, content, score?, created_at?}]}       (sorted, <= top_k, per-user scope)
 - GET health: unauthenticated, any 2xx.
 - Auth: Token / Bearer / X-Api-Key (one chosen at registration).
+
+v0.5.0 retrieval upgrades (all hot-path, zero-LLM):
+1. Fine-grained chunking: one chunk per message; long messages split into
+   ~300-word windows with 50-word overlap (pattern validated by InvMem, the
+   cycle-1 open-source #1: coarse multi-message chunks dilute topics and cut
+   conditions away from their conclusions).
+2. Weighted RRF fusion instead of linear score mixing (dense 1.0 / BM25 0.5,
+   k=60): rank-level fusion is scale-free, which the top cycle-1 entries found
+   more stable than mixing raw similarity and BM25 magnitudes.
+3. Same-session adjacency expansion (+/-1 chunk around top seeds): pulls rule
+   premises, Q/A pairs and referents back into the evidence set -- the
+   mechanism behind the cycle-1 leaders' lead on multi-hop and rule-following.
+4. Temporal-aware reranking (zero LLM): a query with "now/currently/最近/目前"
+   style signals (a) boosts chunks by time-decayed ingest recency (exponential,
+   half-life in days -- corpus-rank recency breaks at both corpus extremes) and
+   (b) soft-penalises chunks whose content carries an explicit OLD date anchor
+   ("since 2020"), so superseded facts (moved city, changed job) sink below
+   their updates (mem0 v3's "ADD-only + retrieval-time recency" finding,
+   graphiti's soft-invalidation intuition).
+5. Exact-duplicate suppression at add time (MemOS stage-1 dedup).
+
+The add path stays synchronous-persist-then-ack per the API Guide: by the time
+/add returns 200 the raw chunks are queryable; enrichment (event-time parsing)
+is deterministic and happens inline -- no background worker, nothing to lose.
 """
 
 import asyncio
@@ -88,9 +112,53 @@ EMBED_TIMEOUT = float(os.environ.get("AML_EMBED_TIMEOUT") or "20")
 # so a failure parks it for this many seconds instead of latching it off.
 EMBED_COOLDOWN = float(os.environ.get("AML_EMBED_COOLDOWN") or "90")
 
+# --- retrieval tuning knobs (v0.5.0) ----------------------------------------
+# Weighted-RRF fusion: score = w_dense/(K+rank_dense) + w_lex/(K+rank_lex).
+RRF_K = int(os.environ.get("AML_RRF_K", "60"))
+W_RRF_DENSE = float(os.environ.get("AML_W_RRF_DENSE", "1.0"))
+W_RRF_LEX = float(os.environ.get("AML_W_RRF_LEX", "0.5"))
+
+# Adjacency expansion: this many top-scored chunks act as seeds; each seed's
+# same-session neighbours within AML_ADJ_WINDOW of its ordinal are pulled into
+# the result with score * AML_ADJ_FACTOR (kept below the seed, above noise).
+ADJ_SEEDS = int(os.environ.get("AML_ADJ_SEEDS", "20"))
+ADJ_WINDOW = int(os.environ.get("AML_ADJ_WINDOW", "1"))
+ADJ_FACTOR = float(os.environ.get("AML_ADJ_FACTOR", "0.9"))
+
+# Temporal reranking, multiplicative on the fused score:
+#   current-state query ("where do they live *now*") -> newer chunks boosted
+#   by up to W_NOW * recency_norm (recency_norm 0..1 within the user's corpus)
+#   a plain recency nudge of W_REC * recency_norm always applies
+#   a year/date found in the query boosts chunks containing that year by W_DATE
+W_NOW = float(os.environ.get("AML_W_NOW", "0.6"))
+W_REC = float(os.environ.get("AML_W_REC", "0.12"))
+W_DATE = float(os.environ.get("AML_W_DATE", "0.35"))
+# Current-state queries: ingest recency decays with a half-life in days
+# (corpus-rank recency breaks at both extremes -- see search()), and chunks
+# whose CONTENT carries an explicit old date anchor ("since 2020") are soft-
+# penalised as likely-supersided evidence (graphiti's soft invalidation,
+# minus the LLM).
+RECENCY_HALF_LIFE_DAYS = float(os.environ.get("AML_RECENCY_HALF_LIFE_DAYS", "30"))
+W_STALE = float(os.environ.get("AML_W_STALE", "0.4"))
+STALE_YEARS = int(os.environ.get("AML_STALE_YEARS", "1"))
+# Additive boost for chunks whose content announces a state change ("just
+# moved", "last month") when the query asks about the current state.
+W_CHANGE = float(os.environ.get("AML_W_CHANGE", "0.5"))
+# Temporal factors only reorder chunks inside the SEMANTIC relevance band
+# (cosine >= COS_REL_GATE * best cosine). RRF compresses score differences so
+# hard that an unconditioned multiplier reshuffles arbitrarily (an irrelevant
+# note outranked the actual answer); gating on raw cosine keeps temporal as a
+# tie-breaker among genuinely competing facts. With no dense leg there is no
+# relevance scale at all, so temporal reordering stays off entirely.
+COS_REL_GATE = float(os.environ.get("AML_COS_REL_GATE", "0.5"))
+
+# Fine-grained chunking: long messages become sliding windows.
+CHUNK_WORDS = int(os.environ.get("AML_CHUNK_WORDS", "300"))
+CHUNK_OVERLAP = int(os.environ.get("AML_CHUNK_OVERLAP", "50"))
+
 # Render injects RENDER_GIT_COMMIT on every build, so the live revision stays
 # externally verifiable without anyone maintaining a version string by hand.
-VERSION = os.environ.get("AML_VERSION") or "0.4.0"
+VERSION = os.environ.get("AML_VERSION") or "0.5.0"
 COMMIT = (os.environ.get("AML_COMMIT")
           or os.environ.get("RENDER_GIT_COMMIT")
           or "unknown")
@@ -109,6 +177,10 @@ def db() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
+
+
+def _table_columns(c, table):
+    return {row[1] for row in c.execute(f"PRAGMA table_info({table})")}
 
 
 def init_db():
@@ -134,6 +206,23 @@ def init_db():
             CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
             """
         )
+        # v0.5.0 columns, added in-place so an existing production DB migrates
+        # on first boot instead of forcing a wipe (the Starter-disk DB holds
+        # real ingested history).
+        cols = _table_columns(c, "chunks")
+        if "sess_seq" not in cols:
+            c.execute("ALTER TABLE chunks ADD COLUMN sess_seq INTEGER")
+        if "event_time" not in cols:
+            c.execute("ALTER TABLE chunks ADD COLUMN event_time TEXT")
+        if "content_hash" not in cols:
+            c.execute("ALTER TABLE chunks ADD COLUMN content_hash TEXT")
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_user_session "
+            "ON chunks(user_id, session_id, sess_seq)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(user_id, content_hash)"
+        )
 
 
 init_db()
@@ -143,6 +232,29 @@ init_db()
 
 WORD_RE = re.compile(r"[A-Za-z0-9_]+")
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+# Absolute dates/years in content, kept as the chunk's event-time anchor:
+# ISO/ slashes/dotted dates, bare years, and 年-月-日 CJK forms.
+DATE_RE = re.compile(
+    r"\b((?:19|20)\d{2})[-/.](\d{1,2})(?:[-/.](\d{1,2}))?\b"
+    r"|((?:19|20)\d{2})\s*年(?:\s*(\d{1,2})\s*月)?(?:\s*(\d{1,2})\s*[日号])?"
+    r"|\b((?:19|20)\d{2})\b"
+)
+# Queries implying "what is true right now" -> recency should matter.
+NOW_HINT_RE = re.compile(
+    r"\b(now|currently|current|nowadays|these days|latest|today|tonight|present|as of|so far)\b"
+    r"|现在|如今|目前|当前|最近|近来|当下|现今|这阵子|眼下",
+    re.IGNORECASE,
+)
+# Content announcing a STATE CHANGE ("just moved", "last month") -- the
+# update-language invalidation signal (mem0/graphiti) without an LLM. For
+# current-state queries such chunks are the fresh side of an update.
+RECENT_CHANGE_RE = re.compile(
+    r"\b(just|recently|newly)\s+(moved|started|joined|switched|changed|upgraded|left|quit|bought|sold|got|became)\b"
+    r"|\b(last month|last week|yesterday|this month|this year|a few days ago|new job|new city|new home)\b"
+    r"|刚刚|最近|刚搬|新工作|上个月|上周|昨天|今年",
+    re.IGNORECASE,
+)
 
 
 def tokenize(text: str):
@@ -157,6 +269,62 @@ def count_words(text: str) -> int:
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def parse_event_time(text: str) -> Optional[str]:
+    """First absolute date/year found in the content, normalised.
+
+    This is the chunk's world-time anchor (graphiti's `valid_at` intuition,
+    minus the LLM): used by search to tell "stated in 2023" from "stated
+    yesterday" without trusting the ingest clock alone.
+    """
+    m = DATE_RE.search(text)
+    if not m:
+        return None
+    year = m.group(1) or m.group(4) or m.group(7)
+    month = m.group(2) or m.group(5)
+    day = m.group(3) or m.group(6)
+    if month and day:
+        return f"{year}-{int(month):02d}-{int(day):02d}"
+    if month:
+        return f"{year}-{int(month):02d}"
+    return year
+
+
+def query_years(query: str):
+    """Years the query itself is asking about (e.g. 'What happened in 2024?')."""
+    return sorted({m.group(0) for m in re.finditer(r"\b(?:19|20)\d{2}\b", query)})
+
+
+def split_long_message(text: str, limit: int = CHUNK_WORDS, overlap: int = CHUNK_OVERLAP):
+    """Sliding-window split for one long message (InvMem: ~320/40 windows)."""
+    words = text.split()
+    if len(words) <= limit:
+        return [text]
+    step = max(1, limit - overlap)
+    out = []
+    for i in range(0, len(words), step):
+        win = words[i:i + limit]
+        if win:
+            out.append(" ".join(win))
+        if i + limit >= len(words):
+            break
+    return out
+
+
+def build_chunks(messages):
+    """One unit per message; long messages -> overlapping windows.
+
+    Keeps every message a separate retrieval unit so adjacency expansion has
+    natural neighbours (InvMem's message-boundary chunking).
+    """
+    units = []
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        units.extend(split_long_message(content.strip()))
+    return units
 
 
 # ---------------------------------------------------------------- embeddings
@@ -283,26 +451,6 @@ def embed_texts(texts, text_type="document"):
     return vecs
 
 
-# ---------------------------------------------------------------- chunking
-
-def segment_messages(messages):
-    """Deterministic segmentation: <=20 messages or <=2000 words per chunk."""
-    chunks, cur, cur_words = [], [], 0
-    for m in messages:
-        content = m.get("content")
-        if not isinstance(content, str) or not content.strip():
-            continue
-        w = count_words(content)
-        if cur and (len(cur) >= 20 or cur_words + w > 2000):
-            chunks.append(cur)
-            cur, cur_words = [], 0
-        cur.append(content.strip())
-        cur_words += w
-    if cur:
-        chunks.append(cur)
-    return ["\n".join(c) for c in chunks]
-
-
 # ---------------------------------------------------------------- BM25
 
 def bm25_scores(query_toks, docs_toks, k1=1.2, b=0.75):
@@ -326,10 +474,16 @@ def bm25_scores(query_toks, docs_toks, k1=1.2, b=0.75):
             idf = math.log(1 + (n_docs - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5))
             s += idf * (tf[t] * (k1 + 1)) / (tf[t] + k1 * (1 - b + b * len(d) / avgdl))
         scores.append(s)
-    mx = max(scores) if scores else 0.0
-    if mx > 0:
-        scores = [s / mx for s in scores]
     return scores
+
+
+def _ranks(scores):
+    """0-based ranks, best first; ties keep stable order."""
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    ranks = [0] * len(scores)
+    for rank, idx in enumerate(order):
+        ranks[idx] = rank
+    return ranks
 
 
 # ---------------------------------------------------------------- auth / limits
@@ -438,7 +592,8 @@ async def version():
         "version": VERSION,
         "commit": COMMIT,
         "contract": ["POST /add", "POST /search", "GET /health", "GET /version"],
-        "retrieval": "bm25 + dense fusion (0.65*dense + 0.35*lexical)",
+        "retrieval": ("bm25 + dense weighted-RRF (1.0/0.5, k=60) "
+                      "+ temporal rerank + adjacency expansion"),
         "dense_leg": {
             "backend": leg,
             "model": model,
@@ -538,8 +693,8 @@ async def add(request: Request):
             texts.append(c)
         else:  # multimodal content array -> keep text parts
             texts.append(" ".join(x.get("text", "") for x in c if isinstance(x, dict)))
-    seg = segment_messages([{"content": t} for t in texts])
-    if not seg:
+    units = build_chunks([{"content": t} for t in texts])
+    if not units:
         return err(422, "no usable content")
 
     # Off the event loop: the embedding call is blocking HTTP (up to
@@ -547,28 +702,49 @@ async def add(request: Request):
     # serialise every concurrent request behind one round-trip each. The
     # evaluator drives Add/Search at the concurrency declared at registration,
     # so inline would turn N parallel calls into N sequential ones.
-    vecs = await asyncio.to_thread(embed_texts, seg, "document")  # None -> BM25
+    vecs = await asyncio.to_thread(embed_texts, units, "document")  # None -> BM25
     created = now_iso()
     rid_hash = hashlib.sha256(request_id.encode()).hexdigest()[:12]
 
+    inserted = 0
     with _db_lock, db() as c:
-        for i, text in enumerate(seg):
+        # Per-session ordinal for adjacency expansion: continue the session's
+        # sequence so chunks from different requests in one session chain up.
+        base = c.execute(
+            "SELECT COALESCE(MAX(sess_seq), -1) FROM chunks "
+            "WHERE user_id=? AND session_id=?",
+            (user_id, session_id),
+        ).fetchone()[0] + 1
+        for i, text in enumerate(units):
+            chash = hashlib.sha256(
+                (user_id + "\x00" + text).encode()
+            ).hexdigest()
+            # Exact-duplicate suppression (MemOS stage-1): the same content for
+            # the same user adds no retrieval value and only pollutes the
+            # evidence list. The request itself stays recorded for idempotency.
+            dup = c.execute(
+                "SELECT 1 FROM chunks WHERE user_id=? AND content_hash=? LIMIT 1",
+                (user_id, chash),
+            ).fetchone()
+            if dup:
+                continue
             cid = f"mem_{rid_hash}_{i}"
             blob = None
             if vecs:
                 blob = json.dumps(vecs[i]).encode()
             c.execute(
-                "INSERT OR REPLACE INTO chunks VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO chunks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (cid, user_id, session_id, request_id, text, created,
-                 count_words(text), blob),
+                 count_words(text), blob, base + i, parse_event_time(text), chash),
             )
+            inserted += 1
         c.execute(
             "INSERT OR REPLACE INTO seen_requests VALUES (?,?,?)",
             (request_id, user_id, session_id),
         )
 
     return {"success": True, "request_id": request_id, "user_id": user_id,
-            "session_id": session_id}
+            "session_id": session_id, "chunks_stored": inserted}
 
 
 @app.post("/search")
@@ -600,7 +776,8 @@ async def search(request: Request):
 
     with _db_lock, db() as c:
         rows = c.execute(
-            "SELECT id, content, created_at, vec FROM chunks WHERE user_id=?",
+            "SELECT id, content, created_at, vec, sess_seq, session_id, event_time "
+            "FROM chunks WHERE user_id=? ORDER BY rowid",
             (user_id,),
         ).fetchall()
 
@@ -611,35 +788,151 @@ async def search(request: Request):
     contents = [r[1] for r in rows]
     created = [r[2] for r in rows]
     vecs = [json.loads(r[3]) if r[3] else None for r in rows]
+    sess_seq = [r[4] for r in rows]
+    sessions = [r[5] for r in rows]
+    event_times = [r[6] for r in rows]
 
     q_toks = tokenize(query)
     doc_toks = [tokenize(x) for x in contents]
     lex = bm25_scores(q_toks, doc_toks)
+    lex_rank = _ranks(lex)
 
+    dense_rank = None
     q_vec = None
     if any(v is not None for v in vecs):
         qv = await asyncio.to_thread(embed_texts, [query], "query")
         if qv:
             q_vec = qv[0]
+    if q_vec is not None:
+        dense = []
+        for i in range(len(ids)):
+            if vecs[i] is None:
+                dense.append(0.0)
+                continue
+            dense.append(sum(a * b for a, b in zip(q_vec, vecs[i])))
+        dense_rank = _ranks(dense)
+        # Semantic relevance band: chunks whose raw cosine is within
+        # COS_REL_GATE of the best. Only these may be reordered by the
+        # temporal factors; everything else keeps factor 1.0.
+        _max_cos = max(dense)
+        relevant = {
+            i for i in range(len(ids))
+            if vecs[i] is not None and dense[i] >= COS_REL_GATE * _max_cos
+        }
+
+    # --- temporal signals ----------------------------------------------------
+    q_years = set(query_years(query))
+    current_state = bool(NOW_HINT_RE.search(query))
+    n = len(ids)
+    if n > 1:
+        # Ingest recency must be TIME-based, not corpus-rank: rank-based
+        # recency makes "newest of N" = 1.0, so in a small corpus an
+        # irrelevant note written last rides the boost past genuinely
+        # relevant older facts, and in a large one everything outside the
+        # last few chunks gets ~0. Exponential decay with a day half-life
+        # behaves the same at any corpus size.
+        now_ts = time.time()
+        recency = {}
+        for i in range(n):
+            try:
+                age_days = max(
+                    0.0,
+                    (now_ts - time.mktime(
+                        time.strptime(created[i][:19], "%Y-%m-%dT%H:%M:%S")
+                    )) / 86400.0,
+                )
+            except Exception:
+                age_days = 0.0
+            recency[i] = 1.0 / (1.0 + age_days / RECENCY_HALF_LIFE_DAYS)
+    else:
+        recency = {0: 1.0}
+
+    # Content-level date anchor: an absolute year in the chunk's own text.
+    _this_year = time.gmtime().tm_year
+
+    def _stale_anchor(i):
+        et = event_times[i]
+        if not et:
+            return False
+        try:
+            return int(str(et)[:4]) <= _this_year - STALE_YEARS
+        except Exception:
+            return False
+
+    # --- weighted RRF fusion + temporal factors ------------------------------
+    fused = {}
+    for i in range(n):
+        s = 0.0
+        if dense_rank is not None:
+            s += W_RRF_DENSE / (RRF_K + dense_rank[i] + 1)
+        s += W_RRF_LEX / (RRF_K + lex_rank[i] + 1)
+        factor = 1.0
+        if q_vec is not None and relevant and i in relevant:
+            factor += W_REC * recency[i]
+            if current_state:
+                factor += W_NOW * recency[i]
+            if current_state:
+                factor += W_NOW * recency[i]
+                # Update language beats surface similarity: the embedding can
+                # rank an irrelevant "the user owns X" chunk top-1 on a shared
+                # "the user" fragment (measured 0.438 vs 0.368), so chunks
+                # announcing a state change get their own additive boost.
+                if RECENT_CHANGE_RE.search(contents[i]):
+                    factor += W_CHANGE
+                # "Where do they live NOW": a chunk explicitly anchored to an
+                # old year is the superseded side of an update, not current
+                # state. Soft multiplier -- strongly relevant dated facts
+                # (those that also pass the relevance gate) can still win.
+                if _stale_anchor(i):
+                    factor *= (1.0 - W_STALE)
+        if q_years and any(y in contents[i] for y in q_years):
+            factor += W_DATE
+        fused[i] = s * factor
+
+    # --- adjacency expansion (InvMem pattern) --------------------------------
+    # Seeds = top ADJ_SEEDS fused chunks. Each seed's same-session neighbours
+    # (sess_seq within +/- ADJ_WINDOW) re-enter the ranking at
+    # seed_score * ADJ_FACTOR, so the rule premise, the matching question, or
+    # the referent an otherwise-top seed points at travels with it. A chunk
+    # reachable from several seeds keeps its best (max) score.
+    id_pos = {cid: i for i, cid in enumerate(ids)}
+    seeds = sorted(range(n), key=lambda i: fused[i], reverse=True)[:ADJ_SEEDS]
+    merged = dict(fused)
+    for s_idx in seeds:
+        seq = sess_seq[s_idx]
+        if seq is None:
+            continue
+        with _db_lock, db() as c:
+            neigh = c.execute(
+                "SELECT id, content, created_at FROM chunks "
+                "WHERE user_id=? AND session_id=? AND sess_seq BETWEEN ? AND ?",
+                (user_id, sessions[s_idx], seq - ADJ_WINDOW, seq + ADJ_WINDOW),
+            ).fetchall()
+        for nid, ncontent, ncreated in neigh:
+            score = fused[s_idx] * ADJ_FACTOR
+            if nid in id_pos:
+                pos = id_pos[nid]
+                if score > merged.get(pos, 0.0):
+                    merged[pos] = score
+            else:
+                # chunk not in the corpus snapshot (inserted after the fetch)
+                id_pos[nid] = len(ids)
+                ids.append(nid)
+                contents.append(ncontent)
+                created.append(ncreated)
+                sess_seq.append(None)
+                sessions.append(sessions[s_idx])
+                event_times.append(None)
+                merged[id_pos[nid]] = score
 
     results = []
-    for i in range(len(ids)):
-        s = lex[i]
-        if q_vec is not None and vecs[i] is not None:
-            dot = sum(a * b for a, b in zip(q_vec, vecs[i]))
-            s = 0.65 * dot + 0.35 * lex[i]
-        results.append((s, i))
-
-    results.sort(key=lambda t: t[0], reverse=True)
-    data = []
-    for s, i in results[:top_k]:
+    for i, s in sorted(merged.items(), key=lambda t: t[1], reverse=True)[:top_k]:
         item = {"id": ids[i], "content": contents[i]}
         if s > 0:
             item["score"] = round(float(s), 6)
         item["created_at"] = created[i]
-        data.append(item)
-
-    return {"data": data}
+        results.append(item)
+    return {"data": results}
 
 
 if __name__ == "__main__":

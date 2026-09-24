@@ -62,6 +62,33 @@ BM25 is implemented directly (`bm25_scores`, `k1 = 1.2`, `b = 0.75`) rather than
 pulled in as a dependency, so the ranking function is auditable in one screen and
 the image keeps three runtime dependencies in total.
 
+## 3b. v0.5.0 retrieval upgrades (zero-LLM, hot path)
+
+Cycle 1 of this challenge published its leaderboard in August 2026: the top
+open-source entry (InvMem, 45.06) ran a four-stage pipeline — per-message
+chunking with sliding windows over long messages, dual dense/BM25 recall fused
+by **weighted reciprocal-rank fusion**, and **same-session adjacency
+expansion** around the top seeds. Analysis of the cycle-1 boards also showed
+temporal reasoning was the weakest dimension across all entries. v0.5.0
+adopts those findings; every technique below is deterministic and adds no LLM
+call to the request path.
+
+| Area | v0.4.0 | v0.5.0 | Why |
+|---|---|---|---|
+| Chunking | ≤20 messages or ≤2000 words merged into one chunk | one chunk per message; long messages split into ~300-word windows with 50-word overlap | coarse chunks dilute topics and cut conditions away from their conclusions; message boundaries also give adjacency natural neighbours (InvMem) |
+| Fusion | linear mix `0.65·dense + 0.35·lexical` | weighted RRF: `1.0/(K+rank_dense) + 0.5/(K+rank_lex)`, K=60 | rank-level fusion is scale-free; mixing raw similarity and BM25 magnitudes is brittle (InvMem; standard RRF literature) |
+| Evidence set | top-k of the fused list only | top-20 seeds expanded with same-session neighbours (±1 ordinal) re-entering at seed×0.9 | pulls rule premises, matching questions and referents back into the evidence list — the mechanism behind the cycle-1 lead on rule-following and multi-hop |
+| Temporal ranking | none | event dates parsed from content at add time (`event_time` column); queries containing "now/currently/现在/目前" style signals boost the newest chunks (`W_NOW·recency`), a mild always-on recency nudge (`W_REC`), and a query-year match boost (`W_DATE`) | cycle-1 analysis: temporal reasoning is the field's weakest dimension; mem0 v3 showed retrieval-time recency beats write-time overwriting; this is graphiti's soft-invalidation intuition without the LLM |
+| Dedup | none | exact sha256(content per user) suppressed at add time | MemOS stage-1; duplicates pollute the evidence list |
+
+All weights are environment-tunable (`AML_W_*`, `AML_ADJ_*`, `AML_RRF_*`) with
+the defaults above; `GET /version` reports the active retrieval description.
+
+Deliberately **not** done in v0.5.0, recorded as candidates for v0.6:
+LLM-based fact extraction or query rewriting (hot-path latency and cost on
+/add with up to 500 messages), a knowledge graph (operational weight), and
+cosine near-duplicate suppression (O(n) vector parsing per add).
+
 ## 4. Failure behaviour
 
 - A failing embedding leg is **parked, not latched off**. The first failure starts
