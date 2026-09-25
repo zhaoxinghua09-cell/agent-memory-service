@@ -128,6 +128,14 @@ full scale (single-hop +0.69 pt, i.e. no sign of the subset's apparent
 single-hop loss). The change is adopted on that combined evidence, not on a
 single run.
 
+That figure was then reproduced a second time **under an explicit health
+gate** — the leg self-reported `healthy: true` with `calls: 1382`, i.e. exactly
+one hosted rerank round trip per question, so no question silently fell back to
+the fused order — and both the overall score and all four category figures came
+back **identical** (0.7770; single-hop 0.4566, temporal 0.8021, multi-hop
+0.4493, open-domain 0.8797). What that adds is reproducibility, not
+significance: the +1.67 pt attribution above still stands at ≈1.4σ.
+
 Cost and latency: the leg is one extra hosted round trip per `/search`. Full
 1382-question runs on this machine took 1468 s (v0.6.0) and 1978 s (rerank leg
 without the retuned weights) against 1426 s for the v0.5.0 configuration, so the

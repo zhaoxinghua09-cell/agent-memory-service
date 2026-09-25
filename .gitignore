@@ -19,6 +19,14 @@ service/data/*.db
 _internal/
 *.internal.md
 *内部*.md
+# 内部诊断/回归脚本与旧版备份：公开仓绝不收录。
+# 2026-09-25 实测隐患：本目录曾裸放 _debug_500.py / _diag_c1.py /
+# _verify_v050.py / service/app.py.bak_pre_v060 —— 一旦有人 `git add -A`，
+# 这些会连带进公开仓（虽不含明文密钥，但暴露内部诊断与旧版实现）。
+_*.py
+_*.txt
+*.bak
+*.bak_*
 
 # ---- Python ----
 __pycache__/
