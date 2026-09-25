@@ -1,9 +1,3 @@
----
-title: DESIGN
-type: note
-permalink: workbuddy/2026-09-20-19-28-08/aml-handoff/design
----
-
 # Design notes, changes relative to a baseline, and attribution
 
 This accompanies the source in `service/app.py`. It states what the baseline
@@ -84,10 +78,68 @@ call to the request path.
 All weights are environment-tunable (`AML_W_*`, `AML_ADJ_*`, `AML_RRF_*`) with
 the defaults above; `GET /version` reports the active retrieval description.
 
-Deliberately **not** done in v0.5.0, recorded as candidates for v0.6:
+Deliberately **not** done in v0.5.0, recorded as candidates for a later cycle:
 LLM-based fact extraction or query rewriting (hot-path latency and cost on
 /add with up to 500 messages), a knowledge graph (operational weight), and
-cosine near-duplicate suppression (O(n) vector parsing per add).
+cosine near-duplicate suppression (O(n) vector parsing per add). v0.6.0 spent
+its budget on the rerank leg instead (§3c): the measurements pointed at an
+ordering problem rather than a recall problem, which made a cross-encoder the
+cheaper win than any of the three above.
+
+## 3c. v0.6.0 cross-encoder rerank leg (retrieve-then-rerank)
+
+The fused retriever's remaining failures were predominantly **ordering**
+failures, not recall failures: on single-hop questions the answer chunk was
+usually already inside the retrieved pool but ranked below the cut. That is the
+signature of a bi-encoder setup — query and document are encoded independently,
+so fine-grained relevance has to be inferred from two vectors — and it is
+exactly what a cross-encoder is for (Nogueira & Cho, arXiv:1901.04085). The
+challenge's FAQ 05 places rerankers outside its restricted-model list, so a
+hosted reranking model is admissible.
+
+| Area | v0.5.0 | v0.6.0 | Why |
+|---|---|---|---|
+| Ranking | one-stage: fused order is the answer order | two-stage: top 100 of the fused order reordered by a cross-encoder (`qwen3-rerank`), response cut from the reranked order, candidates beyond the pool keeping their fused order | the pool already contains the answer; a cross-encoder separates it from near-miss distractors |
+| Fusion weights | `1.0/(K+rank_dense) + 0.5/(K+rank_lex)`, K=60 | `0.8/(K+rank_dense) + 0.8/(K+rank_lex)`, K=60 | with the rerank leg in place the dense leg had been over-weighted; measured over 9 configurations, 2:1 → 1:1 was the largest single gain |
+| Adjacency window | ±1 ordinal around top-20 seeds | ±2 | mild but consistent; the effect beyond ±2 flattens |
+| Diagnosis surface | `dense_leg` only | `dense_leg` + `rerank_leg` on `GET /version` | the leg fails silently by design (see §4), so it has to be visible from outside |
+
+Measured on the local bench (challenge dataset, 10 conversations, 1382
+questions, recall@20), same database and same evaluation harness throughout:
+
+| Category | n | v0.5.0 | v0.6.0 | Δ |
+|---|---|---|---|---|
+| overall | 1382 | 0.6819 | **0.7770** | **+9.51 pt** |
+| single-hop | 213 | 0.3465 | 0.4566 | +11.01 pt |
+| temporal | 299 | 0.7246 | 0.8021 | +7.75 pt |
+| multi-hop | 66 | 0.4066 | 0.4493 | +4.27 pt |
+| open-domain | 802 | 0.7776 | 0.8797 | +10.21 pt |
+
+Attribution of the total: the rerank leg alone (fused weights unchanged at 2:1)
+accounted for 0.7603, and the retuned weights and adjacency window supplied the
+remaining **+1.67 pt** to 0.7770.
+
+That last figure is stated with its uncertainty rather than as a settled fact:
++1.67 pt on 1382 questions is ≈23 questions, one standard deviation is ≈1.15 pt,
+so the effect is ≈1.4σ — **suggestive, not conclusive on its own**. It was
+reproduced independently on a 417-question subset (+1.96 pt at a 1.15σ scale of
+its own) under the same harness, and all four categories were non-regressing at
+full scale (single-hop +0.69 pt, i.e. no sign of the subset's apparent
+single-hop loss). The change is adopted on that combined evidence, not on a
+single run.
+
+Cost and latency: the leg is one extra hosted round trip per `/search`. Full
+1382-question runs on this machine took 1468 s (v0.6.0) and 1978 s (rerank leg
+without the retuned weights) against 1426 s for the v0.5.0 configuration, so the
+added cost is small next to the embedding round trip, while the spread between
+the two reranked runs (≈35%) is provider-side latency variance rather than a
+property of the configuration.
+
+An **RRF blend** of the reranked rank with the fused rank exists
+(`AML_RERANK_BLEND`), written for the failure mode where a confident fused
+match is pushed out of the top-20 by the cross-encoder. Measured +0.13 pt on a
+417-question subset — inside noise — so it is **off by default** and kept only
+as a documented switch.
 
 ## 4. Failure behaviour
 
@@ -96,6 +148,15 @@ cosine near-duplicate suppression (O(n) vector parsing per add).
   that a single transient fault at start-up silently degrades an entire evaluation
   run to lexical-only, with nothing visible from the outside; the cooldown keeps
   recovery automatic and bounded.
+- The rerank leg fails **open**: a missing key, a timeout, a non-2xx answer or an
+  empty result list all leave the fused order untouched, so the service cannot
+  fail because of it. The cost of that choice is invisibility, and it is not
+  hypothetical: on 2026-09-25 the provider account went into arrears
+  (`HTTP 400 Arrearage`), a 30-minute evaluation run silently measured the
+  no-rerank path, and the result read like "reranking brings nothing". The last
+  call's outcome is therefore published on `GET /version` as
+  `rerank_leg.healthy` / `rerank_leg.last_error` (e.g. `HTTP 400 Arrearage`),
+  and checking it from outside is a pre-submission step, not a nicety.
 - The concurrency limiter deliberately does **not** count authenticated traffic. It
   is a brute-force guard: only rejected authentications advance the window, and the
   key that passes is never throttled. The evaluator is the only credentialled client,
@@ -136,6 +197,13 @@ Stated plainly rather than left for a reader to discover:
   end to end, and the conservative declaration stands until it is.
 - On a free platform tier the filesystem is ephemeral. The keep-alive described
   in `README.md` mitigates that constraint; it does not remove it.
+- The rerank leg adds a **paid, external dependency to the hot path**, and the
+  published score depends on it. If the key loses quota or the account is in
+  arrears the service stays up and answerable while scoring like v0.5.0. This is
+  a deliberate trade — never fail a scored run — but it means the deployed
+  quality is a function of an account's billing state, and the only defence is
+  the `GET /version` check above. No figure in this document was measured with
+  that leg degraded.
 
 ## 6. Attribution — prior work this builds on
 
@@ -152,6 +220,16 @@ Stated plainly rather than left for a reader to discover:
   Distillation*, 2024. Retained as the self-hosted fallback leg so the service can
   still run fully offline; it is not the leg used in the deployed configuration.
   Used as published; the model is neither modified nor redistributed.
+- **Qwen3-Reranker** — Y. Zhang, M. Li, D. Long, X. Zhang, H. Lin, B. Yang,
+  P. Xie, A. Yang, D. Liu, J. Lin, F. Huang, J. Zhou, *Qwen3 Embedding:
+  Advancing Text Embedding and Reranking Through Foundation Models*,
+  arXiv:2506.05176, 2025 (Apache-2.0). Called as a hosted reranking endpoint of
+  Alibaba Cloud Model Studio; used as published, neither modified nor
+  redistributed. In the deployed configuration this is the rerank leg.
+- **Retrieve-then-rerank** — R. Nogueira and K. Cho, *Passage Re-ranking with
+  BERT*, arXiv:1901.04085, 2019. The two-stage arrangement used here (cheap
+  recall, then expensive cross-encoder over the pool) follows this pattern; the
+  implementation is ours.
 - **Ollama** — local inference server used to host the fallback embedding model.
 - **FastAPI** / **Starlette** / **Uvicorn** — web framework and ASGI server.
 - **httpx** — HTTP client used for embedding calls.

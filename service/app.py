@@ -158,7 +158,7 @@ CHUNK_OVERLAP = int(os.environ.get("AML_CHUNK_OVERLAP", "50"))
 
 # Render injects RENDER_GIT_COMMIT on every build, so the live revision stays
 # externally verifiable without anyone maintaining a version string by hand.
-VERSION = os.environ.get("AML_VERSION") or "0.5.0"
+VERSION = os.environ.get("AML_VERSION") or "0.6.0"
 COMMIT = (os.environ.get("AML_COMMIT")
           or os.environ.get("RENDER_GIT_COMMIT")
           or "unknown")
@@ -166,6 +166,90 @@ COMMIT = (os.environ.get("AML_COMMIT")
 MAX_TOP_K = 200
 MAX_MESSAGES = 500
 MAX_BODY_BYTES = int(os.environ.get("AML_MAX_BODY_BYTES") or str(16 * 1024 * 1024))
+
+# --- v0.6.0: cross-encoder rerank leg (FAQ 05: Reranker is NOT restricted) --
+# Pipeline: hybrid RRF + temporal + adjacency -> merged ranking; then the top
+# AML_RERANK_CANDIDATES chunks go to a DashScope cross-encoder (qwen3-rerank)
+# which reorders them by query-document relevance; final top_k is cut from
+# the reranked order. Measured on LoCoMo single-hop misses (n=187, local
+# bench 2026-09-25): recall@20 0.2557 -> 0.3681 (+11.2pt) at pool=50;
+# pool=100 adds +5.4pt more on the 86 recall-leg misses (0.2293 -> 0.2833).
+# Safety: any API error/timeout/empty result silently falls back to the
+# merged order, so the service never fails because of the rerank leg.
+RERANK_ON = os.environ.get("AML_RERANK", "0") == "1"
+RERANK_MODEL = os.environ.get("AML_RERANK_MODEL", "qwen3-rerank")
+RERANK_CANDIDATES = int(os.environ.get("AML_RERANK_CANDIDATES", "100"))
+RERANK_TIMEOUT = float(os.environ.get("AML_RERANK_TIMEOUT", "10"))
+# 纯替换式精排会丢掉词法/稠密侧的强信号（2026-09-25 实测 417 题子集：涨 72 / 跌 48，
+# 其中多题 gold 从 recall 1.0 直接掉出 top-20）。置 1 则把「精排名次」与「原融合名次」
+# 做 RRF 混合后再截断 —— 保留精排的排序增益，同时不让原序里的强命中被一脚踢出。
+RERANK_BLEND = os.environ.get("AML_RERANK_BLEND", "0") == "1"
+RERANK_BLEND_W = float(os.environ.get("AML_RERANK_BLEND_W", "0.7"))
+
+# Visibility for a leg that fails silently by design (2026-09-25 incident): when
+# the rerank call fails the service keeps the merged order, so an evaluation run
+# would be scored on a *different* retrieval path with nothing visible from the
+# outside. That actually happened once -- the provider account went into
+# arrears (HTTP 400 `Arrearage`) and a full 30-minute run silently measured the
+# no-rerank order. The last call's outcome and a short reason are therefore
+# published on the read-only `GET /version`, so a run can be validated from
+# outside without log access. Carries no key, no query text and no documents.
+_rerank_state = {"called": 0, "ok": None, "error": None}
+
+
+def _rerank_fail(reason: str) -> None:
+    _rerank_state["called"] += 1
+    _rerank_state["ok"] = False
+    _rerank_state["error"] = reason
+
+
+def _rerank_scores(query: str, docs: list[str]) -> Optional[list[int]]:
+    """Return doc indices sorted by cross-encoder relevance (desc).
+
+    Returns None on any failure -- caller then keeps the merged order.
+    Uses httpx (already a dependency) inside a worker thread.
+    """
+    api_key = os.environ.get("AML_DASHSCOPE_KEY", "")
+    if not api_key or not docs:
+        _rerank_fail("no_key" if not api_key else "no_docs")
+        return None
+    url = ("https://dashscope.aliyuncs.com/api/v1/services/"
+           "rerank/text-rerank/text-rerank")
+    body = {"model": RERANK_MODEL,
+            "input": {"query": query, "documents": docs},
+            "parameters": {"return_documents": False,
+                           "top_n": len(docs)}}
+    try:
+        r = httpx.post(url, json=body, timeout=RERANK_TIMEOUT,
+                       headers={"Authorization": "Bearer " + api_key,
+                                "User-Agent": "aml-memory-service/0.6"})
+        r.raise_for_status()
+        results = r.json().get("output", {}).get("results")
+        if not isinstance(results, list) or not results:
+            _rerank_fail("empty_result")
+            return None
+        order = [x["index"] for x in results
+                 if isinstance(x, dict) and isinstance(x.get("index"), int)]
+        if not order:
+            _rerank_fail("no_index_field")
+            return None
+        _rerank_state["called"] += 1
+        _rerank_state["ok"] = True
+        _rerank_state["error"] = None
+        return order
+    except Exception as e:
+        # Status code plus the vendor error code is what makes a failure
+        # diagnosable; the request body (query/documents) never appears here.
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        detail = ""
+        if code is not None:
+            try:
+                payload = e.response.json()
+            except Exception:
+                payload = {}
+            detail = str(payload.get("code") or payload.get("message") or "")[:80]
+        _rerank_fail(f"HTTP {code} {detail}".strip() if code else type(e).__name__)
+        return None
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -592,13 +676,32 @@ async def version():
         "version": VERSION,
         "commit": COMMIT,
         "contract": ["POST /add", "POST /search", "GET /health", "GET /version"],
-        "retrieval": ("bm25 + dense weighted-RRF (1.0/0.5, k=60) "
-                      "+ temporal rerank + adjacency expansion"),
+        # The description is assembled from the values actually in force, so it
+        # cannot drift from behaviour the way a hand-maintained string does.
+        "retrieval": ("bm25 + dense weighted-RRF "
+                      f"({W_RRF_DENSE:g}/{W_RRF_LEX:g}, k={RRF_K}) "
+                      "+ temporal rerank + adjacency expansion"
+                      + (f" + cross-encoder rerank ({RERANK_MODEL}, "
+                         f"pool={RERANK_CANDIDATES}"
+                         + (", blended" if RERANK_BLEND else "") + ")"
+                         if RERANK_ON else "")),
         "dense_leg": {
             "backend": leg,
             "model": model,
             "dim": EMBED_DIM if model else None,
             "healthy": _embed_state["ok"],
+        },
+        # Exposed because this leg degrades silently by design (see the note on
+        # `_rerank_state`): a run must be checkable from outside before it is
+        # submitted. `healthy` is null until the first rerank call happens.
+        "rerank_leg": {
+            "enabled": RERANK_ON,
+            "model": RERANK_MODEL if RERANK_ON else None,
+            "candidates": RERANK_CANDIDATES if RERANK_ON else None,
+            "blended": RERANK_BLEND if RERANK_ON else None,
+            "calls": _rerank_state["called"],
+            "healthy": _rerank_state["ok"],
+            "last_error": _rerank_state["error"],
         },
     }
 
@@ -925,8 +1028,33 @@ async def search(request: Request):
                 event_times.append(None)
                 merged[id_pos[nid]] = score
 
+    # --- v0.6.0 cross-encoder rerank leg -------------------------------------
+    # Merged order (hybrid+temporal+adjacency) supplies candidates; the
+    # cross-encoder reorders the top RERANK_CANDIDATES by true query-document
+    # relevance. Falls back to the merged order on any failure.
+    merged_sorted = sorted(merged.items(), key=lambda t: t[1], reverse=True)
+    if RERANK_ON and merged_sorted:
+        cand = merged_sorted[:RERANK_CANDIDATES]
+        order = await asyncio.to_thread(
+            _rerank_scores, query, [contents[i] for i, _ in cand])
+        if order and all(0 <= x < len(cand) for x in order):
+            seen = set(order)
+            if RERANK_BLEND:
+                bl = {}
+                for pos, x in enumerate(order):            # 精排名次
+                    bl[x] = bl.get(x, 0.0) + RERANK_BLEND_W / (RRF_K + pos + 1)
+                for pos in range(len(cand)):               # 原融合名次
+                    bl[pos] = bl.get(pos, 0.0) + (1.0 - RERANK_BLEND_W) / (RRF_K + pos + 1)
+                new_order = sorted(bl, key=lambda x: -bl[x])
+                merged_sorted = ([cand[x] for x in new_order]
+                                 + merged_sorted[len(cand):])
+            else:
+                # reranked part first, then the rest in merged order (stable tail)
+                tail = [x for x in range(len(cand)) if x not in seen]
+                merged_sorted = [cand[x] for x in order + tail] + merged_sorted[len(cand):]
+
     results = []
-    for i, s in sorted(merged.items(), key=lambda t: t[1], reverse=True)[:top_k]:
+    for i, s in merged_sorted[:top_k]:
         item = {"id": ids[i], "content": contents[i]}
         if s > 0:
             item["score"] = round(float(s), 6)

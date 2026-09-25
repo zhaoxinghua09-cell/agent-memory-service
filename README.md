@@ -1,9 +1,3 @@
----
-title: README
-type: note
-permalink: workbuddy/2026-09-20-19-28-08/aml-handoff/readme-1
----
-
 # Agent Memory Service — self-hosted Add / Search API
 
 A minimal, dependency-light memory service exposing the two endpoints an
@@ -49,6 +43,11 @@ api-key: <key>
 | `AML_EMBED_COOLDOWN` | `90` | how long a failed dense leg is parked before being retried |
 | `AML_EMBED_MODEL` | `bge-m3` | Ollama fallback embedding model |
 | `AML_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama fallback endpoint; unreachable ⇒ dense legs skipped |
+| `AML_RERANK` | `0` | set to `1` to enable the cross-encoder rerank leg (hosted `qwen3-rerank`); needs `AML_DASHSCOPE_KEY` |
+| `AML_RERANK_MODEL` | `qwen3-rerank` | rerank model; FAQ 05 of the challenge places rerankers outside the restricted-model list |
+| `AML_RERANK_CANDIDATES` | `100` | how many top fused candidates are sent to the cross-encoder |
+| `AML_RERANK_TIMEOUT` | `10` | per-rerank-call timeout, seconds |
+| `AML_RERANK_BLEND` / `AML_RERANK_BLEND_W` | `0` / `0.7` | blend the reranked order with the fused order by RRF instead of replacing it |
 | `AML_RATE_LIMIT` | `240` | per-minute ceiling applied to **rejected** authentications only; a valid key is never throttled |
 | `AML_MAX_BODY_BYTES` | `16777216` | request bodies larger than this are answered `413` unread |
 | `AML_RRF_K` / `AML_W_RRF_DENSE` / `AML_W_RRF_LEX` | `60` / `1.0` / `0.5` | weighted-RRF fusion constant and dense/lexical weights |
@@ -127,11 +126,19 @@ itself, so a probe there always looks healthy and wakes nothing.
 - **Storage** — a single SQLite file in WAL mode; no external database.
 - **Retrieval** — hybrid: BM25 over per-message chunks (long messages split into
   ~300-word sliding windows) fused with a dense cosine term by **weighted RRF**
-  (`1.0/(K+rank_dense) + 0.5/(K+rank_lex)`); the top seeds are then expanded with
-  same-session neighbours (±1), and a temporal-aware factor boosts recent chunks
-  when the query asks about the present ("now / 最近 / 目前") or matches a year
-  named in the query. Queries and documents are encoded asymmetrically
-  (`text_type=query` on search, `document` on write).
+  (`0.8/(K+rank_dense) + 0.8/(K+rank_lex)`, K = 60); the top-20 seeds are then
+  expanded with same-session neighbours (±2), and a temporal-aware factor boosts
+  recent chunks when the query asks about the present ("now / 最近 / 目前") or
+  matches a year named in the query. The top 100 candidates of that fused order
+  are then reordered by a **cross-encoder** (hosted `qwen3-rerank`) and the
+  response is cut from the reranked order. Queries and documents are encoded
+  asymmetrically (`text_type=query` on search, `document` on write).
+  The rerank leg is optional (`AML_RERANK=1`) and treats every failure as a
+  fallback to the fused order, so it can never break a scored run — which also
+  means it can degrade invisibly. `GET /version` therefore reports
+  `rerank_leg.healthy` and `rerank_leg.last_error`; **check it from outside
+  before submitting a run** (a provider account in arrears answers
+  `HTTP 400 Arrearage` and the whole leg silently disappears).
 - **Writes are synchronous and idempotent** — a chunk is committed before the 200
   is returned, and a replay of the same `request_id` is accepted without
   duplicating data.
