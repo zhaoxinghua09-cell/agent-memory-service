@@ -1,5 +1,12 @@
 # Agent Memory Service — self-hosted Add / Search API
 
+![Stars](https://img.shields.io/github/stars/zhaoxinghua09-cell/agent-memory-service?style=flat-square)
+![License](https://img.shields.io/github/license/zhaoxinghua09-cell/agent-memory-service?style=flat-square)
+![Last commit](https://img.shields.io/github/last-commit/zhaoxinghua09-cell/agent-memory-service/main?style=flat-square)
+![Retrieval](https://img.shields.io/badge/retrieval-BM25%20%2B%20dense%20RRF-2ea44f?style=flat-square)
+![Fallback](https://img.shields.io/badge/fallback-Ollama%20%E2%86%92%20BM25-orange?style=flat-square)
+![Deploy](https://img.shields.io/badge/deploy-Docker%20%2B%20Render%20Blueprint-0068ff?style=flat-square)
+
 A minimal, dependency-light memory service exposing the two endpoints an
 evaluation harness calls. Retrieval is hybrid: BM25 over per-message chunks
 fused with a dense cosine term by weighted reciprocal-rank fusion, followed by
