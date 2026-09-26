@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+title: "Agent Memory Service — self-hosted Add/Search API"
+message: "If you use this software, please cite it using these metadata."
+type: software
+authors:
+  - family-names: Zhao
+    given-names: Xinghua
+    email: zhaoxinghua2022@qq.com
+    orcid: "https://orcid.org/0009-0001-0512-1237"
+    affiliation:
+      name: "Steven Zhao·China（署名口径：赵兴华 / Steven Zhao·China）"
+abstract: "Self-hosted memory API with hybrid BM25 + dense retrieval, offline-capable, persisted writes."
+keywords:
+  - "agent-memory"
+  - "retrieval"
+  - "rag"
+  - "api"
+repository-code: "https://github.com/zhaoxinghua09-cell/agent-memory-service"
+license: "Apache-2.0"
