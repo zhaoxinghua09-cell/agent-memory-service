@@ -8,6 +8,25 @@ Contract (per AML API Guide, cycle 2):
 - GET health: unauthenticated, any 2xx.
 - Auth: Token / Bearer / X-Api-Key (one chosen at registration).
 
+v0.7.0 retrieval tuning (defaults re-measured, still hot-path / zero-LLM):
+- Retrieval weights now ship as the measured optimum rather than the earlier
+  guess: `W_RRF_LEX` 0.5 -> 0.8 and `ADJ_SEEDS` 20 -> 40. On 120 stratified
+  LoCoMo questions with the dense leg live, that pair scores 0.9046 overall
+  against 0.8744 for the old defaults, reproduced across two independent
+  runs; every category moved up or held. Both are also the only levers that
+  survived a sweep while the temporal branch below is inert.
+- stdout is now reserved for data. The dev-key notice moved to stderr: on
+  stdout it was parsed as five numbers by the T6 regression test and cost
+  that group a spurious failure.
+- Correction worth recording: the temporal knobs are NOT the lever they look
+  like. With the dense leg provably alive (embed liveness probe 10/10),
+  driving `W_NOW` to 10 and `W_REC` to 5 left recall bit-identical. The
+  reason is `event_time` granularity, not code: the corpus carries a bare
+  year per chunk, so all chunks of a year share one age, `recency` is a
+  constant inside the relevance band, and the factor becomes a scale factor
+  that reorders nothing. The machinery stays and is correct; it will bite
+  once `event_time` carries month or day detail.
+
 v0.5.0 retrieval upgrades (all hot-path, zero-LLM):
 1. Fine-grained chunking: one chunk per message; long messages split into
    ~300-word windows with 50-word overlap (pattern validated by InvMem, the
@@ -36,6 +55,7 @@ is deterministic and happens inline -- no background worker, nothing to lose.
 import asyncio
 import os
 import re
+import sys
 import json
 import time
 import math
@@ -82,7 +102,13 @@ if not API_KEY:
     import secrets as _secrets
 
     API_KEY = _secrets.token_urlsafe(24)
-    print(f"[dev] AML_API_KEY not set -> generated ephemeral key (loopback only): {API_KEY}")
+    # stderr, not stdout. The dev key line used to go to stdout, where it
+    # polluted anything that parses the service's standard output as data --
+    # it cost the T6 regression test its numbers once, because the rig read
+    # `[dev]`, `AML_API_KEY`, `not`, `set`, `->` as the five expected floats.
+    # stdout is the data channel; operational chatter belongs on stderr.
+    print(f"[dev] AML_API_KEY not set -> generated ephemeral key "
+          f"(loopback only): {API_KEY}", file=sys.stderr)
 
 # --- dense retrieval legs ---------------------------------------------------
 # Ollama leg: a local inference server. Kept for self-hosted runs; on a PaaS
@@ -116,12 +142,19 @@ EMBED_COOLDOWN = float(os.environ.get("AML_EMBED_COOLDOWN") or "90")
 # Weighted-RRF fusion: score = w_dense/(K+rank_dense) + w_lex/(K+rank_lex).
 RRF_K = int(os.environ.get("AML_RRF_K", "60"))
 W_RRF_DENSE = float(os.environ.get("AML_W_RRF_DENSE", "1.0"))
-W_RRF_LEX = float(os.environ.get("AML_W_RRF_LEX", "0.5"))
+# Measured on 120 stratified LoCoMo questions with the dense leg live
+# (ollama/bge-m3, top_k=100), reproduced across two independent runs at
+# 0.9046 overall vs 0.8744 for the previous 0.5. Raising the lexical weight
+# helps because BM25 is the leg that survives a chunk splitting mid-fact.
+W_RRF_LEX = float(os.environ.get("AML_W_RRF_LEX", "0.8"))
 
 # Adjacency expansion: this many top-scored chunks act as seeds; each seed's
 # same-session neighbours within AML_ADJ_WINDOW of its ordinal are pulled into
 # the result with score * AML_ADJ_FACTOR (kept below the seed, above noise).
-ADJ_SEEDS = int(os.environ.get("AML_ADJ_SEEDS", "20"))
+# Same sweep: 40 seeds beat 20 by +0.77pt alone and +2.09pt on top of
+# W_RRF_LEX=0.8, the single largest gain measured. Doubling the seed count
+# costs nothing at query time -- it only reads rows already in memory.
+ADJ_SEEDS = int(os.environ.get("AML_ADJ_SEEDS", "40"))
 ADJ_WINDOW = int(os.environ.get("AML_ADJ_WINDOW", "1"))
 ADJ_FACTOR = float(os.environ.get("AML_ADJ_FACTOR", "0.9"))
 
@@ -130,6 +163,18 @@ ADJ_FACTOR = float(os.environ.get("AML_ADJ_FACTOR", "0.9"))
 #   by up to W_NOW * recency_norm (recency_norm 0..1 within the user's corpus)
 #   a plain recency nudge of W_REC * recency_norm always applies
 #   a year/date found in the query boosts chunks containing that year by W_DATE
+#
+# These four knobs measured as a *no-op* on the 120-question sweep even with
+# the dense leg provably alive: pushing W_NOW to 10, W_REC to 5 and
+# COS_REL_GATE to 0.05 left overall recall bit-identical to baseline. The cause
+# is the granularity of `event_time`, not the code. In LoCoMo every chunk
+# carries a bare year -- the corpus has exactly three distinct values, '2022',
+# '2023' and '2024' -- so every chunk of a given year has an identical age,
+# `recency[i]` is a constant inside the relevance band, and the factor becomes
+# a global scale factor that reorders nothing. W_DATE is separately inert
+# because these questions do not contain a literal four-digit year. Keep the
+# machinery (it is correct and will bite on corpora that do carry dates); do
+# not spend tuning time here until `event_time` reaches month or day detail.
 W_NOW = float(os.environ.get("AML_W_NOW", "0.6"))
 W_REC = float(os.environ.get("AML_W_REC", "0.12"))
 W_DATE = float(os.environ.get("AML_W_DATE", "0.35"))
@@ -151,6 +196,10 @@ W_CHANGE = float(os.environ.get("AML_W_CHANGE", "0.5"))
 # tie-breaker among genuinely competing facts. With no dense leg there is no
 # relevance scale at all, so temporal reordering stays off entirely.
 COS_REL_GATE = float(os.environ.get("AML_COS_REL_GATE", "0.5"))
+# Off = the ingest clock is the only time signal (the pre-fix behaviour, kept
+# only so the fix above can be measured against it). On = chunk world time
+# first. Production runs the fixed path; no variable needs setting.
+TEMP_LEGACY_CLOCK = os.environ.get("AML_TEMP_LEGACY_CLOCK", "0") == "1"
 
 # Fine-grained chunking: long messages become sliding windows.
 CHUNK_WORDS = int(os.environ.get("AML_CHUNK_WORDS", "300"))
@@ -158,7 +207,7 @@ CHUNK_OVERLAP = int(os.environ.get("AML_CHUNK_OVERLAP", "50"))
 
 # Render injects RENDER_GIT_COMMIT on every build, so the live revision stays
 # externally verifiable without anyone maintaining a version string by hand.
-VERSION = os.environ.get("AML_VERSION") or "0.6.0"
+VERSION = os.environ.get("AML_VERSION") or "0.7.0"
 COMMIT = (os.environ.get("AML_COMMIT")
           or os.environ.get("RENDER_GIT_COMMIT")
           or "unknown")
@@ -339,6 +388,44 @@ RECENT_CHANGE_RE = re.compile(
     r"|刚刚|最近|刚搬|新工作|上个月|上周|昨天|今年",
     re.IGNORECASE,
 )
+
+
+def _age_days(event_time, created_at, now_ts: float,
+              world_clock: bool = True) -> float:
+    """Age of one chunk in days, on the *world* clock rather than the storage one.
+
+    Recency has to measure when a fact happened, not when it was filed away.
+    A backfilled memory store ingests years of history inside a single sitting
+    -- measured on this corpus at 5,893 chunks inside a 17-minute window -- so
+    an ingest-only clock gives every chunk the same age of roughly zero. The
+    temporal branch then multiplies every score by an identical constant and
+    does nothing at all, which is worse than having no temporal feature,
+    because the feature is advertised in `/version`'s retrieval description
+    while contributing exactly nothing.
+
+    `event_time` is the anchor parsed out of the chunk text at ingest time
+    ("2022", "2022-03", "2022-03-04"). Where it is absent -- a store fed by a
+    live stream, say -- the ingest clock is the only honest signal there is.
+
+    `world_clock=False` reproduces the pre-fix behaviour (ingest clock only).
+    That is not a live path: it exists so this change can be measured against
+    the code it replaces with the environment-variable sweep, because "the
+    feature was a no-op" is exactly the kind of claim that should be checked
+    rather than asserted.
+    """
+    cands = (event_time, created_at) if world_clock else (created_at,)
+    for cand in cands:
+        if not cand:
+            continue
+        s = str(cand).strip()
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%m", "%Y"):
+            for probe in (s, s[:19]):
+                try:
+                    t = time.mktime(time.strptime(probe, fmt))
+                except (ValueError, TypeError):
+                    continue
+                return max(0.0, (now_ts - t) / 86400.0)
+    return 0.0
 
 
 def tokenize(text: str):
@@ -967,15 +1054,12 @@ async def search(request: Request):
         now_ts = time.time()
         recency = {}
         for i in range(n):
-            try:
-                age_days = max(
-                    0.0,
-                    (now_ts - time.mktime(
-                        time.strptime(created[i][:19], "%Y-%m-%dT%H:%M:%S")
-                    )) / 86400.0,
-                )
-            except Exception:
-                age_days = 0.0
+            # World time first, ingest clock only as a fallback: see
+            # `_age_days`. Reading the ingest clock here made every recency
+            # value 1.0 for a bundled corpus, so the temporal branch below was
+            # a constant multiplier and therefore a no-op.
+            age_days = _age_days(event_times[i], created[i], now_ts,
+                                 not TEMP_LEGACY_CLOCK)
             recency[i] = 1.0 / (1.0 + age_days / RECENCY_HALF_LIFE_DAYS)
     else:
         recency = {0: 1.0}
