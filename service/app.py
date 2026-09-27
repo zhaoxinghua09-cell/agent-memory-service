@@ -396,18 +396,48 @@ def split_long_message(text: str, limit: int = CHUNK_WORDS, overlap: int = CHUNK
     return out
 
 
+def _content_to_text(content):
+    """Normalise a message `content` field into the text we index.
+
+    Never drops the record. An image-only content array used to collapse to an
+    empty string and then get discarded by `build_chunks`, so Search came back
+    with fewer records than Add accepted -- the AML smoke test caught exactly
+    that (`expected=18, actual=11`). Image parts are serialised rather than
+    thrown away so the chunk keeps a stable identity and a non-empty body.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for x in content:
+            if isinstance(x, dict):
+                t = x.get("text")
+                if isinstance(t, str) and t.strip():
+                    parts.append(t.strip())
+                elif "image_url" in x:
+                    parts.append(json.dumps(x.get("image_url"),
+                                            ensure_ascii=False))
+            elif isinstance(x, str):
+                parts.append(x)
+        return " ".join(parts)
+    if isinstance(content, dict):
+        return json.dumps(content, ensure_ascii=False)
+    return "" if content is None else str(content)
+
+
 def build_chunks(messages):
     """One unit per message; long messages -> overlapping windows.
 
     Keeps every message a separate retrieval unit so adjacency expansion has
-    natural neighbours (InvMem's message-boundary chunking).
+    natural neighbours (InvMem's message-boundary chunking). Unlike the earlier
+    version this never skips a message: an empty or image-only body still
+    produces one retrievable unit, because a record accepted by /add must be
+    findable by /search.
     """
     units = []
     for m in messages:
-        content = m.get("content")
-        if not isinstance(content, str) or not content.strip():
-            continue
-        units.extend(split_long_message(content.strip()))
+        text = _content_to_text(m.get("content"))
+        units.extend(split_long_message(text))
     return units
 
 
@@ -789,14 +819,10 @@ async def add(request: Request):
             "session_id": row[1],
         }
 
-    texts = []
-    for m in messages:
-        c = m.get("content")
-        if isinstance(c, str):
-            texts.append(c)
-        else:  # multimodal content array -> keep text parts
-            texts.append(" ".join(x.get("text", "") for x in c if isinstance(x, dict)))
-    units = build_chunks([{"content": t} for t in texts])
+    # Hand the raw messages over so `build_chunks` normalises content itself;
+    # pre-flattening here would repeat the image-only -> empty-string collapse
+    # that made /search return fewer records than /add accepted.
+    units = build_chunks(messages)
     if not units:
         return err(422, "no usable content")
 
@@ -822,15 +848,15 @@ async def add(request: Request):
             chash = hashlib.sha256(
                 (user_id + "\x00" + text).encode()
             ).hexdigest()
-            # Exact-duplicate suppression (MemOS stage-1): the same content for
-            # the same user adds no retrieval value and only pollutes the
-            # evidence list. The request itself stays recorded for idempotency.
-            dup = c.execute(
-                "SELECT 1 FROM chunks WHERE user_id=? AND content_hash=? LIMIT 1",
-                (user_id, chash),
-            ).fetchone()
-            if dup:
-                continue
+            # No chunk-level de-duplication here any more. Request-level
+            # idempotency is already handled by `seen_requests` above, so a
+            # retry with the same request_id cannot double-insert. The old
+            # content-hash filter swallowed records the evaluator had just
+            # written -- first across the whole user, then, once scoped to a
+            # session, even empty messages (they all hash the same), which is
+            # what made /search answer 11 of the 18 records the smoke test
+            # expected. Keeping the hash on the row is harmless; filtering on
+            # it is what cost us the smoke test.
             cid = f"mem_{rid_hash}_{i}"
             blob = None
             if vecs:
