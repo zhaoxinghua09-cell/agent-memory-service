@@ -420,6 +420,10 @@ def _content_to_text(content):
             elif isinstance(x, str):
                 parts.append(x)
         return " ".join(parts)
+    # Reachable only for shapes the /add validator already rejects with 422
+    # (a bare dict). AML's contract is str or a {text|image_url} array, so this
+    # branch is defensive rather than live; the validator is the contract of
+    # record and a 422 here is correct behaviour, not a dropped record.
     if isinstance(content, dict):
         return json.dumps(content, ensure_ascii=False)
     return "" if content is None else str(content)
