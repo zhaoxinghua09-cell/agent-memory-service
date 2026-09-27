@@ -207,7 +207,7 @@ CHUNK_OVERLAP = int(os.environ.get("AML_CHUNK_OVERLAP", "50"))
 
 # Render injects RENDER_GIT_COMMIT on every build, so the live revision stays
 # externally verifiable without anyone maintaining a version string by hand.
-VERSION = os.environ.get("AML_VERSION") or "0.7.0"
+VERSION = os.environ.get("AML_VERSION") or "0.7.1"
 COMMIT = (os.environ.get("AML_COMMIT")
           or os.environ.get("RENDER_GIT_COMMIT")
           or "unknown")
@@ -257,17 +257,36 @@ def _rerank_scores(query: str, docs: list[str]) -> Optional[list[int]]:
 
     Returns None on any failure -- caller then keeps the merged order.
     Uses httpx (already a dependency) inside a worker thread.
+
+    Blank documents are removed before the call and their original positions
+    are put back on the way out. Both halves matter:
+
+    - the vendor rejects the *entire* request when any single document is
+      blank (`HTTP 400 InvalidParameter: text input should not be empty`).
+      Since /add is now required to keep empty messages, one such record
+      would silently turn reranking off for that user's every search;
+    - filtering inside here keeps the indices we return in the caller's
+      coordinate system, so no renumbering leaks upward. Dropped documents
+      simply fall into the caller's stable tail, i.e. they rank last, which
+      is the right place for a record with no text to match against.
     """
     api_key = os.environ.get("AML_DASHSCOPE_KEY", "")
     if not api_key or not docs:
         _rerank_fail("no_key" if not api_key else "no_docs")
         return None
+    keep = [i for i, d in enumerate(docs) if d and d.strip()]
+    if not keep:
+        # Every candidate is blank, so there is nothing to score. Deliberately
+        # not routed through _rerank_fail: the health flag is meant to say
+        # "the vendor call failed", and no call was made. Marking it unhealthy
+        # here would let an all-empty corpus masquerade as a broken leg.
+        return None
     url = ("https://dashscope.aliyuncs.com/api/v1/services/"
            "rerank/text-rerank/text-rerank")
     body = {"model": RERANK_MODEL,
-            "input": {"query": query, "documents": docs},
+            "input": {"query": query, "documents": [docs[i] for i in keep]},
             "parameters": {"return_documents": False,
-                           "top_n": len(docs)}}
+                           "top_n": len(keep)}}
     try:
         r = httpx.post(url, json=body, timeout=RERANK_TIMEOUT,
                        headers={"Authorization": "Bearer " + api_key,
@@ -277,8 +296,12 @@ def _rerank_scores(query: str, docs: list[str]) -> Optional[list[int]]:
         if not isinstance(results, list) or not results:
             _rerank_fail("empty_result")
             return None
-        order = [x["index"] for x in results
-                 if isinstance(x, dict) and isinstance(x.get("index"), int)]
+        # Indices arrive relative to the filtered list; map them back to the
+        # caller's positions before returning. The bounds test is on the
+        # filtered length, since that is the list the vendor saw.
+        order = [keep[x["index"]] for x in results
+                 if isinstance(x, dict) and isinstance(x.get("index"), int)
+                 and 0 <= x["index"] < len(keep)]
         if not order:
             _rerank_fail("no_index_field")
             return None
