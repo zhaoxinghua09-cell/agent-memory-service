@@ -73,6 +73,27 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("AML_DB_PATH", APP_DIR / "data" / "memory.db"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+# --- traffic capture (debug, 2026-09-29) -------------------------------------
+# The AML smoke test failed three times with the same opaque summary
+# ("expected=18, actual=11") while every local hypothesis kept passing. To see
+# what the platform actually asks, record every /add and /search request to a
+# JSONL file next to the database and expose it via GET /debug/traffic
+# (authenticated). Capture is best-effort and never touches the response path;
+# disable with AML_DEBUG_TRAFFIC=0. REMOVE before the final declared version.
+DEBUG_TRAFFIC = os.environ.get("AML_DEBUG_TRAFFIC", "1") == "1"
+DEBUG_FILE = DB_PATH.parent / "debug_traffic.jsonl"
+
+
+def _dbg_capture(kind: str, payload: dict):
+    if not DEBUG_TRAFFIC:
+        return
+    try:
+        row = {"ts": time.time(), "kind": kind, **payload}
+        with open(DEBUG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # diagnostics must never break the contract path
+
 _MANAGED = bool(os.environ.get("PORT"))  # 平台注入 PORT == 托管环境（PaaS / 容器平台）
 
 # 鉴权密钥取「第一个非空」的环境变量，按优先级依次尝试：
@@ -803,6 +824,28 @@ def err(status: int, reason: str):
 
 # ---------------------------------------------------------------- endpoints
 
+@app.get("/debug/traffic")
+async def debug_traffic(request: Request):
+    """Authenticated read-back of captured platform traffic (debug only)."""
+    denied = guard(request)
+    if denied is not None:
+        return denied
+    rows = []
+    if DEBUG_FILE.exists():
+        try:
+            with open(DEBUG_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for line in lines[-400:]:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+        except Exception as e:
+            return {"detail": {"reason": f"read failed: {e}"}}
+    rows.reverse()  # newest first
+    return {"count": len(rows), "rows": rows}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -994,6 +1037,13 @@ async def add(request: Request):
             (request_id, user_id, session_id),
         )
 
+    _dbg_capture("add", {
+        "request_id": request_id, "user_id": user_id, "session_id": session_id,
+        "messages": len(messages), "chunks_stored": inserted,
+        "roles": [str(m.get("role")) for m in messages][:30],
+        "content_types": [type(m.get("content")).__name__ for m in messages][:30],
+        "content_heads": [str(m.get("content"))[:80] for m in messages][:30],
+    })
     return {"success": True, "request_id": request_id, "user_id": user_id,
             "session_id": session_id, "chunks_stored": inserted}
 
@@ -1205,6 +1255,12 @@ async def search(request: Request):
             item["score"] = round(float(s), 6)
         item["created_at"] = created[i]
         results.append(item)
+    _dbg_capture("search", {
+        "user_id": user_id, "top_k": top_k, "returned": len(results),
+        "query": str(query)[:400],
+        "top3": [{"id": r["id"], "content": str(r["content"])[:120]}
+                 for r in results[:3]],
+    })
     return {"data": results}
 
 
