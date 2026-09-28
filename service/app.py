@@ -202,7 +202,15 @@ COS_REL_GATE = float(os.environ.get("AML_COS_REL_GATE", "0.5"))
 TEMP_LEGACY_CLOCK = os.environ.get("AML_TEMP_LEGACY_CLOCK", "0") == "1"
 
 # Fine-grained chunking: long messages become sliding windows.
-CHUNK_WORDS = int(os.environ.get("AML_CHUNK_WORDS", "300"))
+# 2026-09-28: default raised 300 -> 4000. The AML smoke test failed twice with
+# "expected=18, actual=11" because any message over 300 words was fragmented
+# into sliding windows whose contents no longer equal the original message,
+# so the platform's expected-record matcher could never match them (verified
+# live: a 400-word message stored as 3 window chunks, none matching). The AML
+# Add contract caps a message at 2,000 words and text-embedding-v4 accepts
+# 8,192 tokens, so 4,000 words keeps every contract-sized message whole.
+# Set AML_CHUNK_WORDS explicitly to override.
+CHUNK_WORDS = int(os.environ.get("AML_CHUNK_WORDS", "4000"))
 CHUNK_OVERLAP = int(os.environ.get("AML_CHUNK_OVERLAP", "50"))
 
 # Render injects RENDER_GIT_COMMIT on every build, so the live revision stays
