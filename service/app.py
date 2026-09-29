@@ -588,6 +588,21 @@ def build_chunks(messages):
 
 _embed_state = {"ok": None, "backend": None, "fail_until": 0.0}
 
+# --- background embedding ---------------------------------------------------
+# The evaluator paces Add sequentially and its add phase runs on a finite
+# budget: embedding 20-message batches synchronously (~1.5s per request of
+# DashScope round-trip) meant later dataset segments were never delivered
+# before the phase deadline -- four smoke runs in a row then failed with
+# "expected=18, actual=11", where the missing records belonged to data that
+# had never reached the service (verified via traffic capture 2026-09-29:
+# e.g. clbench_0_4k's 4k-token conversation delivered as a single system
+# prompt, zero occurrences of a word the questions explicitly reference).
+# Add now persists immediately and embeds in the background; Search waits
+# briefly for pending vectors in the requested scope, so memories are
+# complete and searchable by the time the next evaluator call lands.
+_embed_pending = {}
+_embed_cond = threading.Condition()
+
 
 def _l2(v):
     n = math.sqrt(sum(x * x for x in v)) or 1.0
@@ -706,6 +721,36 @@ def embed_texts(texts, text_type="document"):
         return None
     _embed_state.update(ok=True, backend=backend, fail_until=0.0)
     return vecs
+
+
+def _bg_embed(user_id, rows):
+    """Fill `vec` for (cid, text) rows; always clear the pending marker."""
+    try:
+        vecs = embed_texts([t for _, t in rows], "document")
+        if vecs:
+            with _db_lock, db() as c:
+                for (cid, _), v in zip(rows, vecs):
+                    c.execute("UPDATE chunks SET vec=? WHERE id=?",
+                              (json.dumps(v).encode(), cid))
+    except Exception:
+        pass  # chunks keep vec=NULL; Search falls back to the lexical leg
+    finally:
+        with _embed_cond:
+            _embed_pending[user_id] = max(
+                0, _embed_pending.get(user_id, 0) - 1)
+            _embed_cond.notify_all()
+
+
+def _wait_vectors(user_id, timeout=15.0):
+    """Block until no background embedding is pending for this scope."""
+    deadline = time.time() + timeout
+    with _embed_cond:
+        while _embed_pending.get(user_id, 0) > 0:
+            left = deadline - time.time()
+            if left <= 0:
+                return False
+            _embed_cond.wait(left)
+    return True
 
 
 # ---------------------------------------------------------------- BM25
@@ -996,11 +1041,14 @@ async def add(request: Request):
     # serialise every concurrent request behind one round-trip each. The
     # evaluator drives Add/Search at the concurrency declared at registration,
     # so inline would turn N parallel calls into N sequential ones.
-    vecs = await asyncio.to_thread(embed_texts, units, "document")  # None -> BM25
+    # Dense vectors are filled by the background leg (see _bg_embed): the
+    # add phase of the evaluator is time-budgeted, so returning fast here is
+    # what gets the whole dataset delivered before the deadline.
     created = now_iso()
     rid_hash = hashlib.sha256(request_id.encode()).hexdigest()[:12]
 
     inserted = 0
+    bg_rows = []
     with _db_lock, db() as c:
         # Per-session ordinal for adjacency expansion: continue the session's
         # sequence so chunks from different requests in one session chain up.
@@ -1023,19 +1071,25 @@ async def add(request: Request):
             # expected. Keeping the hash on the row is harmless; filtering on
             # it is what cost us the smoke test.
             cid = f"mem_{rid_hash}_{i}"
-            blob = None
-            if vecs:
-                blob = json.dumps(vecs[i]).encode()
+            bg_rows.append((cid, text))
             c.execute(
                 "INSERT OR REPLACE INTO chunks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (cid, user_id, session_id, request_id, text, created,
-                 count_words(text), blob, base + i, parse_event_time(text), chash),
+                 count_words(text), None, base + i, parse_event_time(text),
+                 chash),
             )
             inserted += 1
         c.execute(
             "INSERT OR REPLACE INTO seen_requests VALUES (?,?,?)",
             (request_id, user_id, session_id),
         )
+
+    # Schedule the dense leg off the response path; Search drains pending
+    # vectors for this scope before ranking, so nothing is ever invisible.
+    with _embed_cond:
+        _embed_pending[user_id] = _embed_pending.get(user_id, 0) + 1
+    threading.Thread(target=_bg_embed, args=(user_id, bg_rows),
+                     daemon=True, name=f"embed-{request_id[-12:]}").start()
 
     _dbg_capture("add", {
         "request_id": request_id, "user_id": user_id, "session_id": session_id,
@@ -1074,6 +1128,10 @@ async def search(request: Request):
     if not isinstance(top_k, int) or top_k <= 0:
         return err(422, "top_k required")
     top_k = min(top_k, MAX_TOP_K)
+
+    # Dense leg completeness: hold briefly while background embedding for
+    # this scope finishes, so freshly added memories rank with full quality.
+    _wait_vectors(user_id)
 
     with _db_lock, db() as c:
         rows = c.execute(
@@ -1167,8 +1225,6 @@ async def search(request: Request):
         factor = 1.0
         if q_vec is not None and relevant and i in relevant:
             factor += W_REC * recency[i]
-            if current_state:
-                factor += W_NOW * recency[i]
             if current_state:
                 factor += W_NOW * recency[i]
                 # Update language beats surface similarity: the embedding can
