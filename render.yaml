@@ -4,7 +4,8 @@
 # Render 会读出本文件并自动建好服务 —— **全程无需手工填写任何值**，
 # 鉴权密钥由平台在 provision 时生成（见下方 generateValue）。
 #
-# 为什么用 Render：免费 Hobby 档即可，无需信用卡，支持 Dockerfile，
+# 为什么用 Render：实例已升 Starter（常驻不休眠，2026-09-25 升级——勿回退 free，
+# free 档休眠唤醒会拖垮评测时限），无需信用卡，支持 Dockerfile，
 # 由 Render 自己的网络拉取本仓库（与本机网络状况无关）。
 
 services:
