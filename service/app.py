@@ -568,6 +568,24 @@ def _content_to_text(content):
     return "" if content is None else str(content)
 
 
+def _blank_placeholder(m):
+    """Honest non-empty stand-in for a message whose normalised text is blank.
+
+    AML's response contract requires every returned record to carry non-empty
+    `content`; a chunk stored with content "" surfaces as an illegal entry and
+    fails the whole eval round (one-veto). Dropping the record is not an
+    option either -- every message accepted by /add must be findable by
+    /search (counts must match 1:1). A truthful placeholder satisfies both
+    constraints: the record stays retrievable and contract-legal.
+    """
+    c = m.get("content") if isinstance(m, dict) else None
+    if isinstance(c, list) and any(
+        isinstance(x, dict) and "image_url" in x for x in c
+    ):
+        return "[image-only message]"
+    return "[blank message]"
+
+
 def build_chunks(messages):
     """One unit per message; long messages -> overlapping windows.
 
@@ -575,11 +593,17 @@ def build_chunks(messages):
     natural neighbours (InvMem's message-boundary chunking). Unlike the earlier
     version this never skips a message: an empty or image-only body still
     produces one retrievable unit, because a record accepted by /add must be
-    findable by /search.
+    findable by /search. Since the blank-message contract fix, a message whose
+    normalised text is blank stores a truthful placeholder ("[blank message]"
+    / "[image-only message]") instead of an empty string, so /search can never
+    return a record with empty content (AML response contract: content is
+    required and non-empty; an illegal entry fails the whole round).
     """
     units = []
     for m in messages:
         text = _content_to_text(m.get("content"))
+        if not text.strip():
+            text = _blank_placeholder(m)
         units.extend(split_long_message(text))
     return units
 

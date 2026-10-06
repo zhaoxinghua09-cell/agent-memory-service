@@ -31,7 +31,7 @@ interpretation.
 | response count | **must not exceed `top_k`**; exceeding it is a **contract error**, never silently truncated | results are cut to `min(top_k, 200)` before the response is built (`merged_sorted[:top_k]`) |
 | response order | the platform preserves the participant's returned order | returned in fused-rank order; no re-ordering after the cut |
 | `POST /search` response | `{"data": [{id, content, score?, created_at?}]}`; **no `items` wrapper**, no bare top-level array | exactly that shape; `score` is emitted only when the fused score is positive |
-| response record fields | `id` and `content` are **required, non-empty**; a record violating this is an illegal item and fails contract validation | `id` is always a generated non-empty string; **`content` mirrors the stored text and is therefore non-empty only as long as no blank message is ever written** — see the caveat below |
+| response record fields | `id` and `content` are **required, non-empty**; a record violating this is an illegal item and fails contract validation | `id` is always a generated non-empty string; **`content` is guaranteed non-empty by the blank-message guard** — see the note below |
 | `POST /add` response | `{"success": true, request_id, user_id, session_id}` — all three ids echoed verbatim | echoed verbatim; `200` is returned only after persistence |
 | request fields not in the spec | `metadata`, `app_id`, `agent_id`, `async_mode` are not sent by the platform | not expected; ignored if present |
 
@@ -41,18 +41,21 @@ before the cut, so the cap is the only thing that can reduce the result set —
 no score threshold, no minimum-count rule sits between storage and the
 response.
 
-**Known caveat (blank messages).** Chunking deliberately never skips a message:
+**Blank-message guard (fixed 2026-10-07, local — pending deploy).** Chunking deliberately never skips a message:
 a record accepted by `/add` must remain findable by `/search`, otherwise the
-count parity that the evaluator checks breaks. The cost of that choice is that
-a message whose content normalises to a blank string is stored with
-`content = ""`, and `/search` would return it verbatim — which the contract
-classifies as an **illegal item** (contract error, immediate failure), not a
-tolerated one. The two captured evaluation runs contained 460 messages with
-zero blank contents, so this has never triggered; it remains a latent risk that
-should be closed before the formal run, e.g. by giving a blank message a
-non-empty, honest representation at add time (its original multimodal
-`text`/`image_url` array where one exists, otherwise an explicit marker) so
-that count parity and field validity hold at the same time.
+count parity that the evaluator checks breaks. The cost of that choice used to
+be that a message whose content normalises to a blank string was stored with
+`content = ""` and returned verbatim by `/search` — which the contract
+classifies as an **illegal item** (contract error, immediate failure). The
+two captured evaluation runs contained 460 messages with zero blank contents,
+so the defect never triggered in the wild. `build_chunks` now stores a
+non-empty, honest representation for any blank message: the original
+multimodal array's image reference becomes `[image-only message]`, everything
+else blank becomes `[blank message]` — count parity and field validity now
+hold at the same time. Verified by a dual-arm in-process regression
+(`test_aml_blankmsg_redteam.py`): patched arm 7/7 PASS (including the
+18-normal + 1-blank count-parity case), pre-patch arm reproduces the defect
+(2/7). The fix ships with the next authorised deploy.
 
 ## 2. Baseline
 
