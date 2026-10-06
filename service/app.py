@@ -577,6 +577,14 @@ def _blank_placeholder(m):
     option either -- every message accepted by /add must be findable by
     /search (counts must match 1:1). A truthful placeholder satisfies both
     constraints: the record stays retrievable and contract-legal.
+
+    Note (2026-10-07 red-team review): the "[image-only message]" branch is
+    currently unreachable for /add-validated input -- any content array that
+    contains an image_url part is serialised by `_content_to_text` into a
+    non-empty JSON string (at minimum 'null'), so it never hits the blank
+    path. The branch is kept as defensive cover in case that normalisation
+    ever changes; image-only messages therefore store their serialised URL,
+    not this placeholder.
     """
     c = m.get("content") if isinstance(m, dict) else None
     if isinstance(c, list) and any(
