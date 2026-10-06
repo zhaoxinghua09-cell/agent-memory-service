@@ -12,8 +12,11 @@ secret*.txt
 *.db
 *.sqlite
 *.sqlite3
-data/*.db
-service/data/*.db
+# 2026-10-07：改为整目录忽略 —— data/ 里除 *.db 外还有 debug_traffic.jsonl
+# （评测流量捕获，内部数据）与 *.db-shm/-wal（SQLite 侧车文件），
+# 旧模式 data/*.db 均不覆盖，`git add -A` 会把它们带进公开仓。
+data/
+service/data/
 
 # ---- 内部工作资料，不公开 ----
 _internal/
