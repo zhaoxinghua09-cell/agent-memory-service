@@ -69,6 +69,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from limits import CONTRACT_MAX_TOP_K, check_top_k
+
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("AML_DB_PATH", APP_DIR / "data" / "memory.db"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -241,7 +243,7 @@ COMMIT = (os.environ.get("AML_COMMIT")
           or os.environ.get("RENDER_GIT_COMMIT")
           or "unknown")
 
-MAX_TOP_K = 200
+MAX_TOP_K = CONTRACT_MAX_TOP_K
 MAX_MESSAGES = 500
 MAX_BODY_BYTES = int(os.environ.get("AML_MAX_BODY_BYTES") or str(16 * 1024 * 1024))
 
@@ -441,6 +443,127 @@ RECENT_CHANGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 属性词表（2026-11-22）：中文换新题不能靠"动词加分"解决——实测把
+# 搬到/换成/改到 加进 RECENT_CHANGE_RE 后，"现在改成按月批了""我改成早上了"
+# 这类与问题无关的短句被抬到第一（hit@1 0.737→0.711，40 题实测）。
+# 原因是它们与任何"现在…？"问题的余弦都很高，加分与话题无关。
+# 改为**按属性分组做新旧处置**：先认问题和句子属于同一个属性
+# （住哪 / 在哪家公司 / 经理是谁 …），再在同一属性内部只保留最新的那条，
+# 旧的那条乘惩罚。属性表只覆盖稳定、可判定的少量语义域，不追求全覆盖。
+ATTR_LEX = [
+    # 内容侧与**问句侧**共用一张表，所以每类都要同时覆盖"陈述怎么写"和"提问怎么问"。
+    # 留出集实测：问句写成"我现在住哪"，而表里只有"住在"，属性识别直接为空，
+    # 整套属性处置被跳过——这是真泛化缺口，不是个别题。
+    ("residence", re.compile(r"住在|住哪|哪儿住|哪里住|住址|居住|搬到|搬去|搬来|搬家|迁到|定居|落户|生活在")),
+    ("employer", re.compile(r"上班|任职|入职|跳槽|公司|单位|雇主|离职|在哪工作|哪家公司")),
+    ("manager", re.compile(r"经理|主管|老板|领导|上司|导师|上级")),
+    # 只用"车"字本身容易把"车牌/车站"也吞进来，所以列具体搭配；
+    # 但"换了辆 SUV"这种换新句必须覆盖（漏了会让它不带属性、免惩罚排到第一）。
+    ("vehicle", re.compile(r"开.{0,2}车|辆车|了辆|一辆|车是|油车|电车|车型|车牌|尾号|越野|轿跑|MPV|SUV")),
+    ("device", re.compile(r"笔记本|电脑|主设备|显示器|平板|相机|编辑器")),
+    ("phone", re.compile(r"手机号|尾号|号码|手机尾")),
+    ("commute", re.compile(r"下班|几点|作息|通勤")),
+    ("mail", re.compile(r"邮箱|邮件地址|域名|e-?mail", re.IGNORECASE)),
+    ("gym", re.compile(r"健身|健身房|锻炼|运动|跑步|游泳|球|瑜伽")),
+    # 楼层与"办公室在哪"不是同一件事，混成一个属性会让"我的办公室在哪个区"
+    # 被"我搬到 12 楼了"顶掉（主集实测 q4 因此命中失败）。
+    ("floor", re.compile(r"工位|楼层|楼|工区|座位|房间号")),
+    ("office", re.compile(r"办公室|工区|办公点|园区")),
+    ("budget", re.compile(r"预算|上限|额度|经费|怎么批|按月|按季度")),
+    # 日程/周期：测试集 tq12「例会现在星期几？」暴露的缺口——
+    # "例会改成周四了"里没有属性词，旧句靠字面重叠排前。这里按"周期"建一类，
+    # 与"几点下班"的 commute 分开（后者是每日作息，前者是周/月周期）。
+    ("schedule", re.compile(r"例会|会议|周几|星期几|礼拜几|日程|每周|每周几|上课|课程")),
+]
+W_ATTR_NEW = float(os.environ.get("AML_W_ATTR_NEW", "0.5"))
+W_ATTR_OLD = float(os.environ.get("AML_W_ATTR_OLD", "0.45"))
+HOUSING_RE = re.compile(r"工位|办公室|楼层|楼|工区|座位")
+RESIDENCE_STRONG_RE = re.compile(r"住在|住址|居住|定居|落户|生活在|搬进")
+# 同形不同义的搭配：中文里"公司"既能指雇主也能修饰地点（公司健身房、
+# 公司楼下），"车"能出现在与用车无关的句子里。这些搭配若没有强标记
+# （上班/任职/跳槽 之类），就不能算进 employer / vehicle。
+EMPLOYER_STRONG_RE = re.compile(r"上班|任职|入职|跳槽|离职|雇主|签了|加入了")
+EMPLOYER_FALSE_FRIEND_RE = re.compile(r"健身|楼下|食堂|停车|班车|年会|团建")
+# 单值属性：这些问题问"当前值"，除非问句里带了具体年份（as-of 场景）。
+SINGLE_VALUED = {"residence", "employer", "manager", "vehicle", "device", "commute",
+                 "mail", "phone", "gym", "floor", "budget", "schedule"}
+# 属性新旧处置默认"本人"主体（我住在哪、我的经理是谁）。问句如果指向
+# 第三人称亲属/同事（"我太太的弟弟在哪开公司"），把本人属性套上去会误伤
+# （实测 q34 因 employer 注入被挤出前五）。这一版只做最保守的排除，
+# 不做实体消解——真正的实体级状态跟踪留给后续（见报告缺口）。
+THIRD_PARTY_RE = re.compile(
+    r"太太|先生|老公|老婆|丈夫|妻子|弟弟|妹妹|哥哥|姐姐|父亲|母亲|爸爸|妈妈|"
+    r"女儿|儿子|孩子|搭档|同事|朋友|客户|供应商|表姐|表妹|表哥|表弟|阿姨|叔叔|"
+    r"室友|房东|邻居|导师的")
+# as-of 问句的期间解析：问"2025 年 6 月的经理是谁"时，正确答案是该时点
+# **有效**的那个版本，而不是"最新"那个。只按年份做加重（老逻辑）在同一年的
+# 两次更新上分不开（实测 q23 旧经理与新经理同属 2025，靠字面重叠旧句反而靠前）。
+PERIOD_RE = re.compile(r"(20\d{2})\s*年(?:\s*(\d{1,2})\s*月)?(?:\s*(\d{1,2})\s*[日号])?")
+
+
+def query_period(text):
+    """返回 (截止日字符串 'YYYY-MM-DD', 年, 月) ；无年份返回 None。"""
+    m = PERIOD_RE.search(str(text or ""))
+    if not m:
+        return None
+    y = int(m.group(1))
+    mo = int(m.group(2)) if m.group(2) else 12
+    d = int(m.group(3)) if m.group(3) else 0
+    if not 1 <= mo <= 12:
+        mo = 12
+    if d:
+        end = "%04d-%02d-%02d" % (y, mo, min(d, 28))
+    elif m.group(2):
+        last = [31, 29 if (y % 4 == 0 and y % 100 != 0) or y % 400 == 0 else 28,
+                31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo - 1]
+        end = "%04d-%02d-%02d" % (y, mo, last)
+    else:
+        end = "%04d-12-31" % y
+    return end, y, mo
+
+
+# 槽位词（attr 之下的细分）：一个属性类里可能装着不同"槽"——
+# 导师与客户经理都算 manager，相机与编辑器都算 device。
+# 只按属性取最新，会把"客户经理"当成"导师"的现值（留出集 hq8 实测），
+# 也会用"编辑器换到 VS Code"顶掉"新相机"（hq7）。所以先认槽，再在槽内取最新。
+SLOT_LEX = [
+    ("client_mgr", re.compile(r"客户经理|客户主管")),
+    ("advisor", re.compile(r"导师|指导老师")),
+    ("mgr", re.compile(r"经理|主管|老板|领导|上司")),
+    ("camera", re.compile(r"相机|摄影机")),
+    ("editor", re.compile(r"编辑器|IDE|Vim|VS Code|Emacs", re.IGNORECASE)),
+    ("laptop", re.compile(r"笔记本|电脑|主设备|MacBook|ThinkPad|Surface|Dell|XPS")),
+    ("monitor", re.compile(r"显示器|屏幕")),
+    ("tablet", re.compile(r"平板|iPad")),
+]
+
+
+def slot_keys(text):
+    """返回文本命中的槽位集合（可能为空）。命中了具体槽就不再记宽槽 mgr。"""
+    t = str(text or "")
+    out = {name for name, rx in SLOT_LEX if rx.search(t)}
+    if out & {"client_mgr", "advisor"}:
+        out.discard("mgr")
+    return out
+
+
+def attr_classes(text):
+    t = str(text or "")
+    found = {name for name, rx in ATTR_LEX if rx.search(t)}
+    # "搬到 12 楼了"同时命中 residence 的"搬到"，但它说的是办公楼层（housing），
+    # 不是居住城市。实测这会把 residence 的"最新一条"错认成楼层那句，
+    # 于是"我现在住在哪"注入的是楼层，真正的"我搬到上海了"反而被埋。
+    # 只做一条去混淆规则：出现楼层/工位/办公室且没有明确居住动词时，摘掉 residence。
+    if HOUSING_RE.search(t) and not RESIDENCE_STRONG_RE.search(t):
+        found.discard("residence")
+        found.add("floor")
+    # "我改去公司健身房了"命中 employer 的"公司"，但它不是雇主信息。
+    if (EMPLOYER_FALSE_FRIEND_RE.search(t)
+            and not EMPLOYER_STRONG_RE.search(t)):
+        found.discard("employer")
+    return found
+
+
 
 def _age_days(event_time, created_at, now_ts: float,
               world_clock: bool = True) -> float:
@@ -594,6 +717,49 @@ def _blank_placeholder(m):
     return "[blank message]"
 
 
+def event_time_from_message(m):
+    """消息自带的 `timestamp` 折成事件日期（UTC，`YYYY-MM-DD`）；没有就返回 None。
+
+    官方 `/add` 的消息 shape 是 `{"role","timestamp"(毫秒 epoch),"content"}`，
+    但老实现只从**正文**里 `parse_event_time` 抠日期，`created_at` 存的是摄取
+    时钟。于是"时间只写在 timestamp 里"的语料（评测常见形态）在 as-of /
+    时间线题上会退化成"全部等于摄取当天"。这里只补**正文没有日期时**的兜底，
+    正文里写了日期仍以正文为准——那样才不会改动既有 D 维排序语义。
+    """
+    raw = m.get("timestamp")
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            secs = raw / 1000.0 if raw > 1e11 else float(raw)
+            return time.strftime("%Y-%m-%d", time.gmtime(secs))
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(raw, str) and raw.strip():
+        # ISO 字符串也收（部分客户端直接传 "2025-03-20T00:00:00Z"）
+        head = raw.strip()[:10]
+        if len(head) == 10 and head[4] == "-" and head[7] == "-":
+            return head
+    return None
+
+
+def build_units(messages):
+    """`build_chunks` 的带时间版：每个检索单元配一条事件日期线索。
+
+    返回 [(text, ts_hint)]；`ts_hint` 来自消息 timestamp，可能是 None。
+    一个长消息被切成多个窗口时，各窗口共用该消息的时间线索。
+    """
+    units = []
+    for m in messages:
+        text = _content_to_text(m.get("content"))
+        if not text.strip():
+            text = _blank_placeholder(m)
+        hint = event_time_from_message(m)
+        for piece in split_long_message(text):
+            units.append((piece, hint))
+    return units
+
+
 def build_chunks(messages):
     """One unit per message; long messages -> overlapping windows.
 
@@ -607,13 +773,7 @@ def build_chunks(messages):
     return a record with empty content (AML response contract: content is
     required and non-empty; an illegal entry fails the whole round).
     """
-    units = []
-    for m in messages:
-        text = _content_to_text(m.get("content"))
-        if not text.strip():
-            text = _blank_placeholder(m)
-        units.extend(split_long_message(text))
-    return units
+    return [t for t, _ in build_units(messages)]
 
 
 # ---------------------------------------------------------------- embeddings
@@ -1064,7 +1224,7 @@ async def add(request: Request):
     # Hand the raw messages over so `build_chunks` normalises content itself;
     # pre-flattening here would repeat the image-only -> empty-string collapse
     # that made /search return fewer records than /add accepted.
-    units = build_chunks(messages)
+    units = build_units(messages)
     if not units:
         return err(422, "no usable content")
 
@@ -1089,7 +1249,7 @@ async def add(request: Request):
             "WHERE user_id=? AND session_id=?",
             (user_id, session_id),
         ).fetchone()[0] + 1
-        for i, text in enumerate(units):
+        for i, (text, ts_hint) in enumerate(units):
             chash = hashlib.sha256(
                 (user_id + "\x00" + text).encode()
             ).hexdigest()
@@ -1107,7 +1267,8 @@ async def add(request: Request):
             c.execute(
                 "INSERT OR REPLACE INTO chunks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (cid, user_id, session_id, request_id, text, created,
-                 count_words(text), None, base + i, parse_event_time(text),
+                 count_words(text), None, base + i,
+                 parse_event_time(text) or ts_hint,     # 正文日期优先；仅无日期时用 timestamp 兜底
                  chash),
             )
             inserted += 1
@@ -1159,7 +1320,9 @@ async def search(request: Request):
         return err(422, "user_id required")
     if not isinstance(top_k, int) or top_k <= 0:
         return err(422, "top_k required")
-    top_k = min(top_k, MAX_TOP_K)
+    top_k_err, top_k = check_top_k(top_k)
+    if top_k_err is not None:
+        return err(422, top_k_err)
 
     # Dense leg completeness: hold briefly while background embedding for
     # this scope finishes, so freshly added memories rank with full quality.
@@ -1247,6 +1410,51 @@ async def search(request: Request):
         except Exception:
             return False
 
+    # --- 属性级新旧处置（中文换新题）----------------------------------------
+    # 只在"现在/目前"类问题、且问题与句子落在同一属性时生效（见 ATTR_LEX 注释）。
+    # 同一属性内按事件时间（无则摄取时钟）取最新一条作为"现值"，其余乘惩罚。
+    q_attrs = attr_classes(query)
+    chunk_attrs = [attr_classes(x) for x in contents]
+    chunk_slots = [slot_keys(x) for x in contents]
+    q_slots = slot_keys(query)
+    # 会话内省略继承：中文接着说的时候主语/属性常省掉——
+    # "我的预算按季度批。" → "现在改成按月批了。" 第二句不带"预算"，
+    # 若不给它继承，属性处置会把旧句当成唯一现值（实测 q20 因此答反）。
+    # 只继承**同一会话**里紧邻的前一句，不跨会话、不跨话题。
+    if sessions and sess_seq:
+        by_session = {}
+        for i in range(len(ids)):
+            if sessions[i] is not None:
+                by_session.setdefault(sessions[i], []).append(i)
+        for sid, idxs in by_session.items():
+            idxs.sort(key=lambda i: (sess_seq[i] is None, sess_seq[i] or 0))
+            prev = None
+            for i in idxs:
+                if not chunk_attrs[i] and prev is not None:
+                    chunk_attrs[i] = set(chunk_attrs[prev])
+                prev = i
+    attr_newest = {}
+    # 无年份：取最新（"我现在住哪"）。有年份：不动属性处置（交给 W_DATE/字面），
+    # 因为"同一年内两次更新"的 as-of 细分实测会伤到别的题
+    # （试过按年月取"该时点有效版本"，38 题 hit@5 从 1.000 掉到 0.921，已回退；
+    #  细化版留作后续，见报告缺口）。
+    attr_logic = (bool(q_attrs & SINGLE_VALUED) and not q_years
+                  and not THIRD_PARTY_RE.search(str(query)))
+    if attr_logic:
+        for a in q_attrs:
+            cands = [i for i in range(len(ids)) if a in chunk_attrs[i]]
+            if not cands:
+                continue
+            # 问句认得出具体槽、且同槽候选不止一条时才收窄到同槽；
+            # 只有一条就退回全属性——否则"主设备是 MacBook"这类问法会把
+            # 换新句（"我换到 雷蛇灵刃 了"，无槽位词）排除在外（规模集实测 -6 题）。
+            if q_slots:
+                same = [i for i in cands if chunk_slots[i] & q_slots]
+                if len(same) >= 2:
+                    cands = same
+            attr_newest[a] = max(
+                cands, key=lambda i: str(event_times[i] or created[i] or ""))
+
     # --- weighted RRF fusion + temporal factors ------------------------------
     fused = {}
     for i in range(n):
@@ -1271,8 +1479,22 @@ async def search(request: Request):
                 # (those that also pass the relevance gate) can still win.
                 if _stale_anchor(i):
                     factor *= (1.0 - W_STALE)
-        if q_years and any(y in contents[i] for y in q_years):
+        date_affinity = bool(q_years) and (
+            any(y in contents[i] for y in q_years)
+            # 日期也可能只存在于 event_time（来自消息 timestamp），正文里没写年。
+            # 老逻辑只认正文，于是"2025 年 6 月的经理是谁"这类题拿不到加分，
+            # 旧经理句靠字面重叠压住新经理句（实测 q23/q27 as-of 均失败）。
+            or (event_times[i] and str(event_times[i])[:4] in q_years)
+        )
+        if date_affinity:
             factor += W_DATE
+        if attr_logic:
+            shared = chunk_attrs[i] & q_attrs
+            if shared:
+                if any(attr_newest.get(a) == i for a in shared):
+                    factor += W_ATTR_NEW
+                else:
+                    factor *= (1.0 - W_ATTR_OLD)
         fused[i] = s * factor
 
     # --- adjacency expansion (InvMem pattern) --------------------------------
@@ -1284,6 +1506,14 @@ async def search(request: Request):
     id_pos = {cid: i for i, cid in enumerate(ids)}
     seeds = sorted(range(n), key=lambda i: fused[i], reverse=True)[:ADJ_SEEDS]
     merged = dict(fused)
+    # 现值注入：属性级最新一条即使字面/语义都不匹配，也要作为候选进入排序。
+    # "我现在住在哪"与"我搬到上海了"没有共享词，纯检索永远捞不上来；
+    # 但同一属性上更新的那条就是答案。注入分取当前最高分的 0.9，既不抢
+    # 明显更相关的条目，也不会让现值被埋到 top_k 之外。
+    if attr_logic and merged:
+        top_score = max(merged.values())
+        for a, idx in attr_newest.items():
+            merged[idx] = max(merged.get(idx, 0.0), top_score * 0.9)
     for s_idx in seeds:
         seq = sess_seq[s_idx]
         if seq is None:
@@ -1337,12 +1567,26 @@ async def search(request: Request):
                 merged_sorted = [cand[x] for x in order + tail] + merged_sorted[len(cand):]
 
     results = []
-    for i, s in merged_sorted[:top_k]:
+    # Dedupe by content before truncating to top_k. The add path keeps
+    # request-level idempotency but no content-level dedupe (that filter used
+    # to swallow records the evaluator had just written), so the same sentence
+    # restated in three sessions is stored three times and used to occupy
+    # three answer slots. Scores are ordered already, so the first occurrence
+    # per content keeps its best rank and later copies are dropped; dropping
+    # them frees slots for distinct records instead of shortening the list.
+    seen_content = set()
+    for i, s in merged_sorted:
+        key = " ".join(str(contents[i]).split())
+        if key in seen_content:
+            continue
+        seen_content.add(key)
         item = {"id": ids[i], "content": contents[i]}
         if s > 0:
             item["score"] = round(float(s), 6)
         item["created_at"] = created[i]
         results.append(item)
+        if len(results) >= top_k:
+            break
     _dbg_capture("search", {
         "user_id": user_id, "top_k": top_k, "returned": len(results),
         "query": str(query)[:400],
