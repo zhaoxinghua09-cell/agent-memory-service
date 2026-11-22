@@ -477,6 +477,24 @@ ATTR_LEX = [
 ]
 W_ATTR_NEW = float(os.environ.get("AML_W_ATTR_NEW", "0.5"))
 W_ATTR_OLD = float(os.environ.get("AML_W_ATTR_OLD", "0.45"))
+# --- 问句时间短语亲和（难例集 n6/n7/n8/n9/n10 暴露）--------------------------
+# 中文问句用"去年夏天 / 上个月 / 上周 / 我以前 / 我在甲公司时的"这类短语指定时间，
+# 而检索只按绝对年份加分（W_DATE），短语一律看不见：于是"去年夏天我住哪"被
+# 最新那句（"今年我搬到大连了"）压住，"我以前开什么车"被"现在换成帕萨特"压住。
+# 这里把短语归成三类（past / recent / now），问句与句子同类就加分。
+# 与 W_DATE 不叠加：带绝对年份的问句仍走 as-of 那一套，避免两套时间口径打架。
+PERIOD_LEX = [
+    ("past", re.compile(r"以前|过去|当时|那时|原来|当年|上家|曾经的|之前的|去年的|前年|去年")),
+    ("past", re.compile(r"时的|的时候|那阵子")),
+    ("recent", re.compile(r"最近|近来|上周|上个星期|上个月|前几天|这两天|刚换|刚刚")),
+    ("now", re.compile(r"现在|目前|当前|如今|眼下|这个月|本月|今年|当下|暂时")),
+]
+W_PERIOD = float(os.environ.get("AML_W_PERIOD", "0.45"))
+# 是非问句（"我现在喝咖啡吗？"）的否定识别：旧值不是被替换而是被否定，
+# "我不再喝咖啡了"与"我每天喝两杯咖啡"字面几乎等价，必须靠否定标记区分。
+# 只在问句确实命是非句式时生效，避免把陈述里的"不"当噪声。
+YESNO_RE = re.compile(r"吗|是否|是不是|要不要|还在不在|有没有")
+NEG_RE = re.compile(r"不再|不喝|不去|不吃|不抽|不用|没有了|没有在|已停|停止|放弃了|戒了|不开了|不在了|不再")
 HOUSING_RE = re.compile(r"工位|办公室|楼层|楼|工区|座位")
 RESIDENCE_STRONG_RE = re.compile(r"住在|住址|居住|定居|落户|生活在|搬进")
 # 同形不同义的搭配：中文里"公司"既能指雇主也能修饰地点（公司健身房、
@@ -563,6 +581,16 @@ def attr_classes(text):
         found.discard("employer")
     return found
 
+
+
+def period_classes(text):
+    """把时间短语归成 past / recent / now；认不出就返回空集。"""
+    t = str(text or "")
+    out = set()
+    for name, rx in PERIOD_LEX:
+        if rx.search(t):
+            out.add(name)
+    return out
 
 
 def _age_days(event_time, created_at, now_ts: float,
@@ -1376,6 +1404,8 @@ async def search(request: Request):
 
     # --- temporal signals ----------------------------------------------------
     q_years = set(query_years(query))
+    q_periods = period_classes(query)
+    q_yesno = bool(YESNO_RE.search(query))
     current_state = bool(NOW_HINT_RE.search(query))
     n = len(ids)
     if n > 1:
@@ -1438,7 +1468,10 @@ async def search(request: Request):
     # 因为"同一年内两次更新"的 as-of 细分实测会伤到别的题
     # （试过按年月取"该时点有效版本"，38 题 hit@5 从 1.000 掉到 0.921，已回退；
     #  细化版留作后续，见报告缺口）。
+    # 问句明确指向过去/近期（"去年夏天""上个月""我以前"）时，不要给"现值"加分——
+    # 那是 as-of 场景，现值注入会把正确答案挤掉（难例 n6/n7 实测如此）。
     attr_logic = (bool(q_attrs & SINGLE_VALUED) and not q_years
+                  and not (q_periods - {"now"})
                   and not THIRD_PARTY_RE.search(str(query)))
     if attr_logic:
         for a in q_attrs:
@@ -1488,6 +1521,15 @@ async def search(request: Request):
         )
         if date_affinity:
             factor += W_DATE
+        # 时间短语同类加分：只对 past / recent 生效。
+        # "现在"必须排除——旧句里常直接写着"我现在住在杭州"，一加分就把真正的
+        # 更新句（"我搬到上海了"，无"现在"二字）压下去（主集 q11/q14/q16/q18
+        # 实测 0.895→0.789 就是这么来的）；当前值语义已由 NOW_HINT_RE + 现值注入负责。
+        if (not q_years) and (period_classes(contents[i]) & q_periods & {"past", "recent"}):
+            factor += W_PERIOD
+        # 是非问句：带否定标记的句子优先（旧值被否定 ≠ 旧值不存在）
+        if q_yesno and NEG_RE.search(contents[i]):
+            factor += W_PERIOD
         if attr_logic:
             shared = chunk_attrs[i] & q_attrs
             if shared:
