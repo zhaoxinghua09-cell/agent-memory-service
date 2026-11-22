@@ -513,6 +513,42 @@ THIRD_PARTY_RE = re.compile(
     r"太太|先生|老公|老婆|丈夫|妻子|弟弟|妹妹|哥哥|姐姐|父亲|母亲|爸爸|妈妈|"
     r"女儿|儿子|孩子|搭档|同事|朋友|客户|供应商|表姐|表妹|表哥|表弟|阿姨|叔叔|"
     r"室友|房东|邻居|导师的")
+
+# --- 第三人称主体消解（代词跨句指代，难例 hq3/hq4 暴露）----------------------
+# 问"我妹妹现在住哪"，答案在"她后来搬去珠海了"里；问"我的经理现在在哪办公"，
+# 答案是"他调去成都了"。这两句只靠代词承接上文主语，属性与问句其实对得上，
+# 但属性处置用的是"本人单值"模型——同一属性下所有条目都算同一个人的状态，
+# 于是本人的"今年我搬到大连了"永远被认成最新，把她/他的更新句乘惩罚压下去
+# （实测 hq3/hq4 hit@1 全败，hit@5 才中）。
+# 处置：给每个 chunk 记主体标签（本人=空集 / 具体第三人称角色），代词的句子
+# 继承同会话紧邻上一句的主体；当前态加分要求主体一致，问第三人称时本人的
+# 变更句不吃当前态加分并额外降权。
+PERSON_LEX = [
+    ("妹妹", re.compile(r"妹妹")), ("姐姐", re.compile(r"姐姐")),
+    ("哥哥", re.compile(r"哥哥")), ("弟弟", re.compile(r"弟弟")),
+    ("太太", re.compile(r"太太|老婆|妻子")),
+    ("先生", re.compile(r"先生|老公|丈夫")),
+    ("母亲", re.compile(r"母亲|妈妈")), ("父亲", re.compile(r"父亲|爸爸")),
+    ("女儿", re.compile(r"女儿")), ("儿子", re.compile(r"儿子")),
+    ("经理", re.compile(r"经理|主管|老板|上司|领导")),
+    ("合伙人", re.compile(r"合伙人|搭档")),
+    ("同事", re.compile(r"同事")), ("朋友", re.compile(r"朋友")),
+    ("客户", re.compile(r"客户|供应商")),
+]
+PRONOUN_RE = re.compile(r"她|他|她们|他们")
+# 以"我"开头的句子把主体重置回本人；但"我妹妹…/我妈…"这类是第三人称主语，
+# 不能当成本人（负向前瞻挡掉）。
+SELF_HEAD_RE = re.compile(
+    r"^\s*(?:今年|去年|最近|上个月|现在|目前|后来)?\s*"
+    r"我(?!妹妹|姐姐|哥哥|弟弟|妈|爸|女|儿|太太|老婆|丈夫|老公|家)")
+W_PERSON_OTHER = float(os.environ.get("AML_W_PERSON_OTHER", "0.5"))
+
+
+def person_keys(text):
+    """返回文本里点明的第三人称角色集合；本人口吻返回空集。"""
+    t = str(text or "")
+    return {name for name, rx in PERSON_LEX if rx.search(t)}
+
 # as-of 问句的期间解析：问"2025 年 6 月的经理是谁"时，正确答案是该时点
 # **有效**的那个版本，而不是"最新"那个。只按年份做加重（老逻辑）在同一年的
 # 两次更新上分不开（实测 q23 旧经理与新经理同属 2025，靠字面重叠旧句反而靠前）。
@@ -1474,6 +1510,11 @@ async def search(request: Request):
     chunk_attrs = [attr_classes(x) for x in contents]
     chunk_slots = [slot_keys(x) for x in contents]
     q_slots = slot_keys(query)
+    q_persons = person_keys(query)
+    chunk_persons = [person_keys(x) for x in contents]
+    # 哪些句子的主体是靠代词继承来的（"他调去成都了"）——这类句子明确是在说那个人，
+    # 即使正文不带属性词（"调去"不落任何属性），也必须进此人现值的候选集。
+    chunk_pronoun = [False] * len(contents)
     # 会话内省略继承：中文接着说的时候主语/属性常省掉——
     # "我的预算按季度批。" → "现在改成按月批了。" 第二句不带"预算"，
     # 若不给它继承，属性处置会把旧句当成唯一现值（实测 q20 因此答反）。
@@ -1490,6 +1531,22 @@ async def search(request: Request):
                 if not chunk_attrs[i] and prev is not None:
                     chunk_attrs[i] = set(chunk_attrs[prev])
                 prev = i
+
+    # 主体标签的代词继承：同会话内按消息顺序，"她后来搬去珠海了"这类只带代词的
+    # 句子继承最近一次点明的主体（"我妹妹在珠海工作"）。"我…"开头的句子把主体
+    # 重置回本人，避免把后面的本人陈述记成妹妹的状态。不跨会话。
+    if sessions and sess_seq:
+        for sid, idxs in by_session.items():
+            idxs.sort(key=lambda i: (sess_seq[i] is None, sess_seq[i] or 0))
+            last = set()
+            for i in idxs:
+                if chunk_persons[i]:
+                    last = set(chunk_persons[i])
+                elif PRONOUN_RE.search(contents[i]) and last:
+                    chunk_persons[i] = set(last)
+                    chunk_pronoun[i] = True
+                elif SELF_HEAD_RE.search(contents[i]):
+                    last = set()
     attr_newest = {}
     # 无年份：取最新（"我现在住哪"）。有年份：不动属性处置（交给 W_DATE/字面），
     # 因为"同一年内两次更新"的 as-of 细分实测会伤到别的题
@@ -1515,6 +1572,31 @@ async def search(request: Request):
             attr_newest[a] = max(
                 cands, key=lambda i: str(event_times[i] or created[i] or ""))
 
+    # 第三人称的"人在这个属性上的现值"：问"我妹妹现在住哪"时，妹妹自己的住处更新
+    # （"她后来搬去珠海了"）就是答案，旧的那句（"她住在佛山"）不是——但这套判断
+    # 不能落到本人头上（原 attr_logic 直接排除第三人称问题，是把整块关了，
+    # 结果两个都拿不到加分，旧句靠字面重叠排第一，hq3/hq4 实测全败）。
+    # 只在"现在"类问题、且问句点名第三人称时启用；问句认得出属性就按同属性收窄，
+    # 认不出（"我的经理在哪办公"）就按人收窄。
+    person_newest = {}
+    if q_persons and current_state:
+        for p in q_persons:
+            cands = [i for i in range(n) if p in chunk_persons[i]]
+            if q_attrs:
+                scoped = [i for i in cands
+                          if (chunk_attrs[i] & q_attrs) or chunk_pronoun[i]]
+                if scoped:
+                    cands = scoped
+            # 带过去标记的句子不是"现在"的候选：难例 hq4 里"我在甲公司时的经理是
+            # 陶然"（更晚写、同属性同角色）会把"他调去成都了"挤掉——角色名相同
+            # 但不是同一个人。判"现在"就该按"是否过去锚定"排除，而不是按新近。
+            fresh = [i for i in cands if not (period_classes(contents[i]) & {"past"})]
+            if fresh:
+                cands = fresh
+            if cands:
+                person_newest[p] = max(
+                    cands, key=lambda i: str(event_times[i] or created[i] or ""))
+
     # --- weighted RRF fusion + temporal factors ------------------------------
     fused = {}
     for i in range(n):
@@ -1530,7 +1612,14 @@ async def search(request: Request):
                 # "现在…"问句（难例 hq1–hq4 实测如此）。要求同属性或实词重叠。
                 same_attr = bool(chunk_attrs[i] & q_attrs)
                 overlap = bool(cjk_bigrams(contents[i]) & q_bigrams)
-                if same_attr or overlap or not now_gate:
+                if q_persons:
+                    # 问的是第三人称（"我妹妹现在住哪""我的经理在哪办公"）时，
+                    # 只认主体对得上的句子；本人的"今年我搬到大连了"哪怕更新、
+                    # 哪怕同属性，也不是这个人的状态（hq3/hq4 全败就是这个原因）。
+                    gate_pass = bool(chunk_persons[i] & q_persons)
+                else:
+                    gate_pass = same_attr or overlap or not now_gate
+                if gate_pass:
                     factor += W_NOW * recency[i]
                     # Update language beats surface similarity: the embedding can
                     # rank an irrelevant "the user owns X" chunk top-1 on a shared
@@ -1544,6 +1633,13 @@ async def search(request: Request):
                 # (those that also pass the relevance gate) can still win.
                 if _stale_anchor(i):
                     factor *= (1.0 - W_STALE)
+        # 第三人称问题下的主体错配降权：不只看"不吃加分"，还要主动压。
+        # 问的是"我的经理现在在哪办公"时，任何没提到这个人的句子都不是答案——
+        # 难例 hq4 里"这个月提到 40 万了"靠稠密分排第一、两条真正讲经理的句子
+        # 并列在后，就是没有这层压。只在"现在"类 + 点名第三人的问法上生效，
+        # 不动"我妹妹在哪工作"这种不带时间词的常规问法。
+        if q_persons and current_state and not (chunk_persons[i] & q_persons):
+            factor *= (1.0 - W_PERSON_OTHER)
         date_affinity = bool(q_years) and (
             any(y in contents[i] for y in q_years)
             # 日期也可能只存在于 event_time（来自消息 timestamp），正文里没写年。
@@ -1569,6 +1665,11 @@ async def search(request: Request):
                     factor += W_ATTR_NEW
                 else:
                     factor *= (1.0 - W_ATTR_OLD)
+        if person_newest:
+            if any(person_newest.get(p) == i for p in (chunk_persons[i] & q_persons)):
+                factor += W_ATTR_NEW
+            elif chunk_persons[i] & q_persons:
+                factor *= (1.0 - W_ATTR_OLD)
         fused[i] = s * factor
 
     # --- adjacency expansion (InvMem pattern) --------------------------------
@@ -1584,9 +1685,12 @@ async def search(request: Request):
     # "我现在住在哪"与"我搬到上海了"没有共享词，纯检索永远捞不上来；
     # 但同一属性上更新的那条就是答案。注入分取当前最高分的 0.9，既不抢
     # 明显更相关的条目，也不会让现值被埋到 top_k 之外。
-    if attr_logic and merged:
+    if (attr_logic or person_newest) and merged:
         top_score = max(merged.values())
-        for a, idx in attr_newest.items():
+        if attr_logic:
+            for a, idx in attr_newest.items():
+                merged[idx] = max(merged.get(idx, 0.0), top_score * 0.9)
+        for p, idx in (person_newest or {}).items():
             merged[idx] = max(merged.get(idx, 0.0), top_score * 0.9)
     for s_idx in seeds:
         seq = sess_seq[s_idx]
