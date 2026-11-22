@@ -593,6 +593,31 @@ def period_classes(text):
     return out
 
 
+# --- 当前态加分的相关性门 -----------------------------------------------------
+# 难例集 hq1–hq4 暴露：只要句子里出现"搬到/换成/调到"这类变更动词，就会拿到
+# W_NOW + W_CHANGE 的叠加（"我现在住在哪"这类题能差 1.0 → 2.1 倍），于是
+# **同一用户下任何一句"我搬到大连了"都通吃所有"现在…"的问法**——问咖啡、
+# 问游泳馆、问妹妹住哪，返回的第一条都是它。这不是"时间信号强"，是把
+# "宣布了变更"错当成"与这个问题有关"。
+# 处置：只有该句与问句落在同一属性，或至少共享一个中文实词 bigram 时，
+# 才允许吃当前态/变更加分。属性重叠负责"我现在住哪"↔"我搬到上海了"
+# 这种字面零重叠但同属性成立的情形。
+CJK_STOP = set("我你他她它的了在有是和与吗呢吧啊么什哪怎这那个们就都也还很太"
+               "请问一下把被给对从到说做要会能可以没不")
+
+
+def cjk_bigrams(text: str) -> set:
+    runs = re.findall(r"[\u4e00-\u9fff]+", str(text or ""))
+    out = set()
+    for run in runs:
+        run = "".join(ch for ch in run if ch not in CJK_STOP)
+        for i in range(len(run) - 1):
+            out.add(run[i:i + 2])
+        if len(run) == 1:
+            out.add(run)
+    return out
+
+
 def _age_days(event_time, created_at, now_ts: float,
               world_clock: bool = True) -> float:
     """Age of one chunk in days, on the *world* clock rather than the storage one.
@@ -1406,6 +1431,8 @@ async def search(request: Request):
     q_years = set(query_years(query))
     q_periods = period_classes(query)
     q_yesno = bool(YESNO_RE.search(query))
+    q_bigrams = cjk_bigrams(query)
+    now_gate = os.environ.get("AML_NOW_GATE", "1") != "0"
     current_state = bool(NOW_HINT_RE.search(query))
     n = len(ids)
     if n > 1:
@@ -1499,13 +1526,18 @@ async def search(request: Request):
         if q_vec is not None and relevant and i in relevant:
             factor += W_REC * recency[i]
             if current_state:
-                factor += W_NOW * recency[i]
-                # Update language beats surface similarity: the embedding can
-                # rank an irrelevant "the user owns X" chunk top-1 on a shared
-                # "the user" fragment (measured 0.438 vs 0.368), so chunks
-                # announcing a state change get their own additive boost.
-                if RECENT_CHANGE_RE.search(contents[i]):
-                    factor += W_CHANGE
+                # 相关性门：只按"宣布了变更"加分会让无关的"我搬到X了"通吃所有
+                # "现在…"问句（难例 hq1–hq4 实测如此）。要求同属性或实词重叠。
+                same_attr = bool(chunk_attrs[i] & q_attrs)
+                overlap = bool(cjk_bigrams(contents[i]) & q_bigrams)
+                if same_attr or overlap or not now_gate:
+                    factor += W_NOW * recency[i]
+                    # Update language beats surface similarity: the embedding can
+                    # rank an irrelevant "the user owns X" chunk top-1 on a shared
+                    # "the user" fragment (measured 0.438 vs 0.368), so chunks
+                    # announcing a state change get their own additive boost.
+                    if RECENT_CHANGE_RE.search(contents[i]):
+                        factor += W_CHANGE
                 # "Where do they live NOW": a chunk explicitly anchored to an
                 # old year is the superseded side of an update, not current
                 # state. Soft multiplier -- strongly relevant dated facts
