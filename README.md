@@ -1,3 +1,7 @@
+> **Copy-left warning — AGPL-3.0.** This repository is licensed AGPL-3.0. You may read it, run it, and self-host it. You may **not** embed it in a closed-source product, and you may not ship it as part of one: network use of a modified version triggers the full source-disclosure obligation. If you need this inside a commercial product, that is a licensing conversation, not a code change — and the answer is not "vendor it quietly".
+
+---
+
 # Agent Memory Service — self-hosted Add / Search API
 ## 许可说明 · License Notice
 
